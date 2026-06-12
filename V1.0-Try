@@ -1,0 +1,79 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.svm import SVR
+from xgboost import XGBRegressor
+from sklearn.metrics import r2_score, mean_squared_error
+
+# ========== 1️⃣ 读取数据（自动判断编码） ==========
+csv_path = r"E:\桌面\0\ML_ready\HIX.csv"  # 修改为你的CSV路径
+try:
+    df = pd.read_csv(csv_path, encoding='utf-8-sig')
+except UnicodeDecodeError:
+    try:
+        df = pd.read_csv(csv_path, encoding='gbk')
+    except Exception as e:
+        print("❌ CSV 打开失败，请检查文件编码或路径：", e)
+        exit()
+
+print("✅ CSV 读取成功！")
+print("📊 数据维度:", df.shape)
+print(df.head(3))
+
+# ========== 2️⃣ 选择特征与目标 ==========
+features = ["PS", "KOH", "Microwave", "R1", "R2", "R3", "R4", "R5"]
+target = "HIX_normalized"
+
+X = df[features]
+y = df[target]
+
+# ========== 3️⃣ 划分训练/测试集 ==========
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# ========== 4️⃣ 标准化 ==========
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# ========== 5️⃣ 定义模型 ==========
+models = {
+    "RandomForest": RandomForestRegressor(n_estimators=300, random_state=42),
+    "SVM": SVR(kernel="rbf", C=50, epsilon=0.05),
+    "GBDT": GradientBoostingRegressor(n_estimators=300, learning_rate=0.05, random_state=42),
+    "XGBoost": XGBRegressor(n_estimators=300, learning_rate=0.05, random_state=42)
+}
+
+# ========== 6️⃣ 训练与评估 ==========
+results = []
+for name, model in models.items():
+    model.fit(X_train_scaled, y_train)
+
+    # 训练集预测
+    y_pred_train = model.predict(X_train_scaled)
+    r2_train = r2_score(y_train, y_pred_train)
+    rmse_train = np.sqrt(mean_squared_error(y_train, y_pred_train))
+
+    # 测试集预测
+    y_pred_test = model.predict(X_test_scaled)
+    r2_test = r2_score(y_test, y_pred_test)
+    rmse_test = np.sqrt(mean_squared_error(y_test, y_pred_test))
+
+    results.append({
+        "Model": name,
+        "R2_train": r2_train,
+        "RMSE_train": rmse_train,
+        "R2_test": r2_test,
+        "RMSE_test": rmse_test
+    })
+
+# ========== 7️⃣ 汇总结果 ==========
+results_df = pd.DataFrame(results)
+print("\n📊 模型性能对比：")
+print(results_df)
+
+# ========== 8️⃣ 保存结果 ==========
+out_path = r"E:\桌面\1\ML_ready\ML_results_summary.csv"
+results_df.to_csv(out_path, index=False, encoding='utf-8-sig')
+print(f"\n✅ 模型性能结果已保存至: {out_path}")

@@ -1,0 +1,108 @@
+# =============================================
+# 🧪 稳健建模模板（小样本 + 多样品 + PCA + 分组CV）
+# =============================================
+
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.model_selection import GroupKFold
+from sklearn.linear_model import Ridge, Lasso
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+from sklearn.metrics import r2_score, mean_squared_error
+import joblib
+import warnings
+warnings.filterwarnings("ignore")
+
+# ========== 1️⃣ 读取 CSV ==========
+df = pd.read_csv(r"E:\桌面\0\ML_ready\HIX.csv")  # <-- 替换成你的 CSV 文件路径
+
+# 确认列名
+print("列名:", df.columns.tolist())
+
+# ========== 2️⃣ 特征与目标 ==========
+feature_cols = ['PS', 'KOH', 'Microwave', 'R1', 'R2', 'R3', 'R4', 'R5']
+target_col = 'HIX_normalized'
+group_col = 'Sample'  # 按样品分组
+
+X_raw = df[feature_cols]
+y = df[target_col]
+groups = df[group_col]
+
+# ========== 3️⃣ PCA 降维 R1-R5 ==========
+scaler_R = StandardScaler()
+R_scaled = scaler_R.fit_transform(X_raw[['R1','R2','R3','R4','R5']])
+pca = PCA(n_components=2)
+R_pca = pca.fit_transform(R_scaled)
+df['PC1'], df['PC2'] = R_pca[:,0], R_pca[:,1]
+
+# 构建最终特征
+X = df[['PS','KOH','Microwave','PC1','PC2']].values
+
+# ========== 4️⃣ 定义模型 ==========
+models = {
+    "Ridge": Ridge(alpha=1.0),
+    "Lasso": Lasso(alpha=0.001),
+    "RandomForest": RandomForestRegressor(n_estimators=200, max_depth=4, min_samples_leaf=3, random_state=42),
+    "XGBoost": XGBRegressor(n_estimators=200, max_depth=3, learning_rate=0.05, random_state=42)
+}
+
+# ========== 5️⃣ 分组交叉验证 ==========
+gkf = GroupKFold(n_splits=min(5, len(np.unique(groups))))
+results = []
+
+for name, model in models.items():
+    r2_list, rmse_list, mse_list = [], [], []
+    for train_idx, test_idx in gkf.split(X, y, groups):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+        # 标准化
+        scaler = StandardScaler()
+        X_train_s = scaler.fit_transform(X_train)
+        X_test_s = scaler.transform(X_test)
+
+        # 训练
+        model.fit(X_train_s, y_train)
+        y_pred = model.predict(X_test_s)
+
+        # 评估
+        r2_list.append(r2_score(y_test, y_pred))
+        mse_list.append(mean_squared_error(y_test, y_pred))
+        rmse_list.append(np.sqrt(mse_list[-1]))
+
+    results.append({
+        "Model": name,
+        "R2_mean": np.mean(r2_list),
+        "RMSE_mean": np.mean(rmse_list),
+        "MSE_mean": np.mean(mse_list)
+    })
+
+# ========== 6️⃣ 汇总结果 ==========
+result_df = pd.DataFrame(results).sort_values("R2_mean", ascending=False)
+print("\n📊 模型性能对比：")
+print(result_df)
+result_df.to_csv("model_comparison_results.csv", index=False)
+
+# ========== 7️⃣ 保存最优模型 ==========
+best_model_name = result_df.iloc[0]['Model']
+best_model = models[best_model_name]
+
+# 用全部数据训练最优模型
+scaler_final = StandardScaler().fit(X)
+X_scaled_final = scaler_final.transform(X)
+best_model.fit(X_scaled_final, y)
+
+# 保存
+joblib.dump({
+    'model': best_model,
+    'scaler': scaler_final,
+    'pca': pca,
+    'features': ['PS','KOH','Microwave','PC1','PC2'],
+    'target': target_col
+}, f'best_model_{best_model_name}.pkl')
+
+print(f"\n✅ 最优模型: {best_model_name} 已保存")
+print("📁 模型文件:", f'best_model_{best_model_name}.pkl')
+print("📁 模型对比结果文件: model_comparison_results.csv")

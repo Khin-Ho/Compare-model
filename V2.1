@@ -1,0 +1,103 @@
+import os
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import GridSearchCV, KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge, Lasso
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+import tempfile
+
+# ==========================
+# 设置 joblib 临时文件夹（避免 Windows 中文路径报错）
+# ==========================
+temp_dir = r"C:\Temp_joblib"
+os.makedirs(temp_dir, exist_ok=True)
+os.environ["JOBLIB_TEMP_FOLDER"] = temp_dir
+
+# ==========================
+# 读取 CSV
+# ==========================
+data_path = r"E:\桌面\0\ML_ready\HIX.csv"  # 修改为你的 CSV
+df = pd.read_csv(data_path, encoding="utf-8-sig")
+print("列名:", df.columns.tolist())
+
+# 特征与目标
+features = ["PS", "KOH", "Microwave", "R1", "R2", "R3", "R4", "R5"]
+target = "HIX_normalized"
+
+X = df[features].values
+y = df[target].values
+
+# ==========================
+# 标准化特征
+# ==========================
+scaler = StandardScaler()
+X = scaler.fit_transform(X)
+
+# ==========================
+# 模型列表和调参
+# ==========================
+models = {
+    "Ridge": Ridge(),
+    "Lasso": Lasso(),
+    "RandomForest": RandomForestRegressor(random_state=42, n_jobs=1),
+    "XGBoost": XGBRegressor(random_state=42, n_jobs=1, verbosity=0),
+}
+
+param_grids = {
+    "Ridge": {"alpha": [0.01, 0.1, 1, 10]},
+    "Lasso": {"alpha": [0.01, 0.1, 1, 10]},
+    "RandomForest": {"n_estimators": [50, 100], "max_depth": [3, 5, None]},
+    "XGBoost": {"n_estimators": [50, 100], "max_depth": [3, 5]},
+}
+
+# ==========================
+# 交叉验证评估函数
+# ==========================
+def cv_evaluate(model, X, y, cv=5):
+    kf = KFold(n_splits=cv, shuffle=True, random_state=42)
+    r2_list, rmse_list, mse_list = [], [], []
+
+    for train_index, test_index in kf.split(X):
+        X_train, X_test = X[train_index], X[test_index]
+        y_train, y_test = y[train_index], y[test_index]
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        r2_list.append(r2_score(y_test, y_pred))
+        rmse_list.append(mean_squared_error(y_test, y_pred) ** 0.5)
+        mse_list.append(mean_squared_error(y_test, y_pred))
+
+    return np.mean(r2_list), np.mean(rmse_list), np.mean(mse_list)
+
+# ==========================
+# 调参、训练和对比
+# ==========================
+results = []
+
+for name, model in models.items():
+    print(f"🔹 调参和训练: {name}")
+    grid = GridSearchCV(model, param_grids[name], cv=3, n_jobs=1)
+    grid.fit(X, y)
+    best_estimator = grid.best_estimator_
+
+    r2_mean, rmse_mean, mse_mean = cv_evaluate(best_estimator, X, y, cv=5)
+    results.append([name, r2_mean, rmse_mean, mse_mean])
+
+# 保存对比结果
+df_results = pd.DataFrame(results, columns=["Model", "R2_mean", "RMSE_mean", "MSE_mean"])
+best_model_name = df_results.sort_values("R2_mean", ascending=False).iloc[0]["Model"]
+best_model = models[best_model_name]
+best_model_path = os.path.join(os.path.dirname(data_path), f"best_model_{best_model_name}.pkl")
+
+import joblib
+joblib.dump(best_model, best_model_path)
+
+df_results.to_csv(os.path.join(os.path.dirname(data_path), "model_comparison_results.csv"),
+                  index=False, encoding="utf-8-sig")
+
+print("\n📊 模型性能对比：")
+print(df_results)
+print(f"\n✅ 最优模型: {best_model_name} 已保存")
+print(f"📁 模型文件: {best_model_path}")

@@ -1,0 +1,175 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, GridSearchCV, RandomizedSearchCV, cross_val_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.ensemble import RandomForestRegressor, VotingRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from xgboost import XGBRegressor
+import joblib as jl
+
+# ====================== 参数设置 ======================
+np.random.seed(42)
+save_folder = r"E:\桌面\3\ML_ready"
+data_path = os.path.join(save_folder, "HIX.csv")
+
+# ====================== 数据读取 ======================
+df = pd.read_csv(data_path, encoding="utf-8-sig")
+print("📂 读取数据列名：", df.columns.tolist())
+
+# 特征与目标
+X = df[["PS", "KOH", "Microwave", "R1", "R2", "R3", "R4", "R5"]].values
+y = df["HIX_normalized"].values
+
+# 数据集划分
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.3, random_state=42
+)
+
+# ====================== 特征标准化 ======================
+scaler = StandardScaler().fit(X_train)
+X_train_scaled = scaler.transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# ====================== 定义模型 ======================
+models = {
+    "LR": LinearRegression(),
+    "KNN": KNeighborsRegressor(),
+    "SVR": SVR(),
+    "DT": DecisionTreeRegressor(),
+    "RF": RandomForestRegressor(),
+    "XGB": XGBRegressor()
+}
+
+# ====================== 超参数调优（GridSearchCV & RandomizedSearchCV） ======================
+
+# 参数范围设定
+param_grid = {
+    "KNN": {'n_neighbors': [3, 5, 7, 9, 11], 'weights': ['uniform', 'distance']},
+    "DT": {'max_depth': [None, 10, 20, 30], 'min_samples_split': [2, 5, 10]},
+    "RF": {'n_estimators': [100, 200, 300], 'max_depth': [None, 10, 20], 'min_samples_split': [2, 5, 10]},
+    "XGB": {'learning_rate': [0.01, 0.1, 0.3], 'n_estimators': [100, 200, 300], 'max_depth': [3, 6, 9]}
+}
+
+
+# ====================== 模型训练与评估函数 ======================
+
+def evaluate_model(name, model, X_train, y_train, X_test, y_test, save_prefix, param_grid=None):
+    # 超参数调优
+    if param_grid:
+        if 'n_estimators' in param_grid:
+            search = RandomizedSearchCV(model, param_grid, n_iter=10, cv=5, random_state=42)
+        else:
+            search = GridSearchCV(model, param_grid, cv=5)
+        search.fit(X_train, y_train)
+        model = search.best_estimator_
+        print(f"最优参数: {search.best_params_}")
+
+    else:
+        model.fit(X_train, y_train)
+
+    # 训练集预测
+    y_train_pred = model.predict(X_train)
+    train_mse = mean_squared_error(y_train, y_train_pred)
+    train_mae = mean_absolute_error(y_train, y_train_pred)
+    train_r2 = r2_score(y_train, y_train_pred)
+
+    # 测试集预测
+    y_test_pred = model.predict(X_test)
+    test_mse = mean_squared_error(y_test, y_test_pred)
+    test_mae = mean_absolute_error(y_test, y_test_pred)
+    test_r2 = r2_score(y_test, y_test_pred)
+
+    print(f"\n🔹 {name} 模型结果:")
+    print(f"训练集 - MSE: {train_mse:.4f}, MAE: {train_mae:.4f}, R2: {train_r2:.4f}")
+    print(f"测试集 - MSE: {test_mse:.4f}, MAE: {test_mae:.4f}, R2: {test_r2:.4f}")
+
+    # 结果保存
+    pd.DataFrame({"Y_true": y_train, "Y_pred": y_train_pred}).to_csv(
+        os.path.join(save_folder, f"{save_prefix}_train.csv"), index=False
+    )
+    pd.DataFrame({"Y_true": y_test, "Y_pred": y_test_pred}).to_csv(
+        os.path.join(save_folder, f"{save_prefix}_test.csv"), index=False
+    )
+
+    # 保存模型
+    jl.dump(model, os.path.join(save_folder, f"{save_prefix}_model.pkl"))
+
+    return {
+        "Model": name,
+        "Train_R2": train_r2,
+        "Test_R2": test_r2,
+        "Train_MAE": train_mae,
+        "Test_MAE": test_mae,
+        "Train_MSE": train_mse,
+        "Test_MSE": test_mse
+    }
+
+
+# ====================== 训练与评估 ======================
+
+results = []
+for name, model in models.items():
+    res = evaluate_model(name, model, X_train_scaled, y_train, X_test_scaled, y_test, name, param_grid.get(name, None))
+    results.append(res)
+
+# ====================== 构建并训练集成模型（VotingRegressor） ======================
+print("\n🔹 构建并训练集成模型...")
+
+base_models = [
+    ("KNN", models["KNN"]),
+    ("DT", models["DT"]),
+    ("RF", models["RF"]),
+    ("XGB", models["XGB"])
+]
+meta_model = LinearRegression()
+
+# 使用 VotingRegressor 来集成多个基模型
+stack_model = VotingRegressor(estimators=base_models)
+stack_model.fit(X_train_scaled, y_train)
+
+y_train_pred = stack_model.predict(X_train_scaled)
+y_test_pred = stack_model.predict(X_test_scaled)
+
+train_mse = mean_squared_error(y_train, y_train_pred)
+train_mae = mean_absolute_error(y_train, y_train_pred)
+train_r2 = r2_score(y_train, y_train_pred)
+
+test_mse = mean_squared_error(y_test, y_test_pred)
+test_mae = mean_absolute_error(y_test, y_test_pred)
+test_r2 = r2_score(y_test, y_test_pred)
+
+print(f"\n🔹 集成模型（VotingRegressor）结果:")
+print(f"训练集 - MSE: {train_mse:.4f}, MAE: {train_mae:.4f}, R2: {train_r2:.4f}")
+print(f"测试集 - MSE: {test_mse:.4f}, MAE: {test_mae:.4f}, R2: {test_r2:.4f}")
+
+# 保存结果
+pd.DataFrame({"Y_true": y_train, "Y_pred": y_train_pred}).to_csv(
+    os.path.join(save_folder, "VotingRegressor_train.csv"), index=False
+)
+pd.DataFrame({"Y_true": y_test, "Y_pred": y_test_pred}).to_csv(
+    os.path.join(save_folder, "VotingRegressor_test.csv"), index=False
+)
+jl.dump(stack_model, os.path.join(save_folder, "VotingRegressor_model.pkl"))
+
+results.append({
+    "Model": "VotingRegressor",
+    "Train_R2": train_r2,
+    "Test_R2": test_r2,
+    "Train_MAE": train_mae,
+    "Test_MAE": test_mae,
+    "Train_MSE": train_mse,
+    "Test_MSE": test_mse
+})
+
+# ====================== 总结结果 ======================
+results_df = pd.DataFrame(results)
+results_path = os.path.join(save_folder, "model_performance_summary.csv")
+results_df.to_csv(results_path, index=False)
+print("\n📊 模型性能汇总：")
+print(results_df)
+print(f"\n✅ 全部模型结果已保存到：{results_path}")

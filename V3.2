@@ -1,0 +1,166 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.linear_model import LinearRegression
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, VotingRegressor
+import joblib as jl
+import tempfile
+
+# ====================== 设置临时目录 ======================
+# 设置 Joblib 临时目录，避免中文路径问题
+temp_folder = r"C:\Temp\joblib_temp"
+os.makedirs(temp_folder, exist_ok=True)
+os.environ["JOBLIB_TEMP_FOLDER"] = temp_folder
+
+# ====================== 数据读取 ======================
+# 假设数据路径已经正确
+df = pd.read_csv(r"E:\桌面\3\ML_ready\HIX.csv", encoding="utf-8-sig")
+print("📂 读取数据列名：", df.columns.tolist())
+
+# 特征与目标
+X = df[["PS", "KOH", "Microwave", "R1", "R2", "R3", "R4", "R5"]].values
+y = df["HIX_normalized"].values
+
+# 数据集划分
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+
+# ====================== 模型与超参数设置 ======================
+models = {
+    "LR": {
+        "model": LinearRegression(),
+        "params": {}
+    },
+    "KNN": {
+        "model": KNeighborsRegressor(),
+        "params": {"n_neighbors": [3, 5, 7, 9, 11], "weights": ["uniform", "distance"]}
+    },
+    "SVR": {
+        "model": SVR(),
+        "params": {"C": [0.1, 1, 10], "kernel": ["linear", "rbf"]}
+    },
+    "DT": {
+        "model": DecisionTreeRegressor(),
+        "params": {"max_depth": [3, 5, 10], "min_samples_split": [2, 5, 10]}
+    },
+    "RF": {
+        "model": RandomForestRegressor(),
+        "params": {"n_estimators": [100, 200], "max_depth": [5, 10, 15]}
+    }
+}
+
+# ====================== 模型训练与评估函数 ======================
+def evaluate_model(name, model, params, X_train, y_train, X_test, y_test, save_folder):
+    # GridSearchCV 超参数调优
+    grid = GridSearchCV(model, params, cv=5, scoring="r2", n_jobs=-1)
+    grid.fit(X_train, y_train)
+
+    # 输出最优参数
+    print(f"{name} 最优参数: {grid.best_params_}")
+
+    # 使用最优参数的模型进行预测
+    best_model = grid.best_estimator_
+
+    # 训练集预测
+    y_train_pred = best_model.predict(X_train)
+    train_mse = mean_squared_error(y_train, y_train_pred)
+    train_mae = mean_absolute_error(y_train, y_train_pred)
+    train_r2 = r2_score(y_train, y_train_pred)
+
+    # 测试集预测
+    y_test_pred = best_model.predict(X_test)
+    test_mse = mean_squared_error(y_test, y_test_pred)
+    test_mae = mean_absolute_error(y_test, y_test_pred)
+    test_r2 = r2_score(y_test, y_test_pred)
+
+    # 打印结果
+    print(f"\n🔹 {name} 模型结果:")
+    print(f"训练集 - MSE: {train_mse:.4f}, MAE: {train_mae:.4f}, R2: {train_r2:.4f}")
+    print(f"测试集 - MSE: {test_mse:.4f}, MAE: {test_mae:.4f}, R2: {test_r2:.4f}")
+
+    # 结果保存
+    pd.DataFrame({"Y_true": y_train, "Y_pred": y_train_pred}).to_csv(
+        os.path.join(save_folder, f"{name}_train.csv"), index=False
+    )
+    pd.DataFrame({"Y_true": y_test, "Y_pred": y_test_pred}).to_csv(
+        os.path.join(save_folder, f"{name}_test.csv"), index=False
+    )
+
+    # 保存模型
+    jl.dump(best_model, os.path.join(save_folder, f"{name}_model.pkl"))
+
+    return {
+        "Model": name,
+        "Train_R2": train_r2,
+        "Test_R2": test_r2,
+        "Train_MAE": train_mae,
+        "Test_MAE": test_mae,
+        "Train_MSE": train_mse,
+        "Test_MSE": test_mse
+    }
+
+# ====================== 训练与评估 ======================
+save_folder = r"E:\桌面\3\ML_ready"
+results = []
+
+for name, mp in models.items():
+    res = evaluate_model(name, mp["model"], mp["params"], X_train, y_train, X_test, y_test, save_folder)
+    results.append(res)
+
+# ====================== 构建集成模型（VotingRegressor） ======================
+print("\n🔹 构建并训练集成模型...")
+
+# 选择一些基础模型
+base_models = [models["KNN"]["model"], models["DT"]["model"], models["RF"]["model"]]
+ensemble_model = VotingRegressor(estimators=[(name, model) for name, model in zip(["KNN", "DT", "RF"], base_models)])
+
+# 训练集成模型
+ensemble_model.fit(X_train, y_train)
+
+# 预测
+y_train_pred = ensemble_model.predict(X_train)
+y_test_pred = ensemble_model.predict(X_test)
+
+train_mse = mean_squared_error(y_train, y_train_pred)
+train_mae = mean_absolute_error(y_train, y_train_pred)
+train_r2 = r2_score(y_train, y_train_pred)
+
+test_mse = mean_squared_error(y_test, y_test_pred)
+test_mae = mean_absolute_error(y_test, y_test_pred)
+test_r2 = r2_score(y_test, y_test_pred)
+
+# 打印集成模型结果
+print(f"\n🔹 集成模型（VotingRegressor）结果:")
+print(f"训练集 - MSE: {train_mse:.4f}, MAE: {train_mae:.4f}, R2: {train_r2:.4f}")
+print(f"测试集 - MSE: {test_mse:.4f}, MAE: {test_mae:.4f}, R2: {test_r2:.4f}")
+
+# 保存集成模型
+pd.DataFrame({"Y_true": y_train, "Y_pred": y_train_pred}).to_csv(
+    os.path.join(save_folder, "VotingRegressor_train.csv"), index=False
+)
+pd.DataFrame({"Y_true": y_test, "Y_pred": y_test_pred}).to_csv(
+    os.path.join(save_folder, "VotingRegressor_test.csv"), index=False
+)
+jl.dump(ensemble_model, os.path.join(save_folder, "VotingRegressor_model.pkl"))
+
+results.append({
+    "Model": "VotingRegressor",
+    "Train_R2": train_r2,
+    "Test_R2": test_r2,
+    "Train_MAE": train_mae,
+    "Test_MAE": test_mae,
+    "Train_MSE": train_mse,
+    "Test_MSE": test_mse
+})
+
+# ====================== 总结结果 ======================
+results_df = pd.DataFrame(results)
+results_path = os.path.join(save_folder, "model_performance_summary.csv")
+results_df.to_csv(results_path, index=False)
+print("\n📊 模型性能汇总：")
+print(results_df)
+print(f"\n✅ 全部模型结果已保存到：{results_path}")

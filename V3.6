@@ -1,0 +1,144 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, StackingRegressor
+from xgboost import XGBRegressor
+from sklearn.feature_selection import SelectKBest, f_regression
+import joblib as jl
+
+# ====================== 配置 ======================
+DATA_PATH = r"E:\桌面\0\ML_ready\HIX.csv"
+SAVE_FOLDER = r"E:\桌面\0\ML_ready"
+JOBLIB_TEMP = r"C:\Temp\joblib_temp"
+os.makedirs(JOBLIB_TEMP, exist_ok=True)
+os.environ["JOBLIB_TEMP_FOLDER"] = JOBLIB_TEMP
+
+TEST_SIZE = 0.3
+CV_FOLDS = 10
+SELECT_K = "all"
+
+print(f"✅ 配置：\n DATA_PATH: {DATA_PATH}\n SAVE_FOLDER: {SAVE_FOLDER}\n JOBLIB_TEMP: {JOBLIB_TEMP}\n TEST_SIZE: {TEST_SIZE}  CV_FOLDS: {CV_FOLDS}  SELECT_K: {SELECT_K}")
+
+# ====================== 数据读取 ======================
+df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+print("\n📂 读取数据列名：", df.columns.tolist())
+
+X = df[["PS", "KOH", "Microwave", "R1", "R2", "R3", "R4", "R5"]]
+y = df["HIX_normalized"]
+
+# ====================== 特征标准化 ======================
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+print("\n🔧 数据标准化完成")
+
+# ====================== 特征选择 ======================
+selector = SelectKBest(score_func=f_regression, k=SELECT_K)
+X_selected = selector.fit_transform(X_scaled, y)
+selected_features = X.columns[selector.get_support()]
+feature_scores = pd.DataFrame({"feature": X.columns, "score": selector.scores_}).sort_values(by="score", ascending=False)
+print("\n🔎 特征选择（SelectKBest f_regression）:")
+print(feature_scores)
+print("Selected features:", list(selected_features))
+
+# ====================== 数据集划分 ======================
+X_train, X_test, y_train, y_test = train_test_split(X_selected, y, test_size=TEST_SIZE, random_state=42)
+print(f"\n数据集划分：\n X_train: {X_train.shape}  X_test: {X_test.shape}  y: {y.shape}")
+
+# ====================== 模型与超参数设置 ======================
+models = {
+    "Ridge": {
+        "model": Ridge(),
+        "params": {"alpha": [0.01, 0.1, 1, 10, 100]}
+    },
+    "KNN": {
+        "model": KNeighborsRegressor(),
+        "params": {"n_neighbors": [3, 5, 7, 9, 11, 15], "weights": ["uniform", "distance"]}
+    },
+    "SVR": {
+        "model": SVR(),
+        "params": {"C": [0.1, 1, 10], "kernel": ["linear", "rbf"], "epsilon": [0.01, 0.1, 0.2]}
+    },
+    "DT": {
+        "model": DecisionTreeRegressor(),
+        "params": {"max_depth": [3, 5, 10, None], "min_samples_split": [2, 5, 10]}
+    },
+    "RF": {
+        "model": RandomForestRegressor(random_state=42),
+        "params": {"n_estimators": [100, 300, 500], "max_depth": [5, 10, 15, None], "min_samples_leaf": [1, 2, 4]}
+    },
+    "XGB": {
+        "model": XGBRegressor(random_state=42, verbosity=0),
+        "params": {
+            "n_estimators": [100, 200, 500],
+            "learning_rate": [0.01, 0.05, 0.1],
+            "max_depth": [3, 5, 7],
+            "subsample": [0.7, 0.9, 1.0],
+            "colsample_bytree": [0.7, 0.9, 1.0]
+        }
+    }
+}
+
+# ====================== 模型训练与评估 ======================
+results = []
+
+for name, cfg in models.items():
+    print(f"\n=== 调参: {name} ===")
+    grid = GridSearchCV(cfg["model"], cfg["params"], cv=CV_FOLDS, scoring="r2", n_jobs=-1)
+    grid.fit(X_train, y_train)
+    best_model = grid.best_estimator_
+
+    cv_scores = cross_val_score(best_model, X_train, y_train, cv=CV_FOLDS, scoring="r2")
+    y_pred_train = best_model.predict(X_train)
+    y_pred_test = best_model.predict(X_test)
+
+    result = {
+        "Model": name,
+        "Train_R2": r2_score(y_train, y_pred_train),
+        "Test_R2": r2_score(y_test, y_pred_test),
+        "Train_MSE": mean_squared_error(y_train, y_pred_train),
+        "Test_MSE": mean_squared_error(y_test, y_pred_test),
+        "Train_MAE": mean_absolute_error(y_train, y_pred_train),
+        "Test_MAE": mean_absolute_error(y_test, y_pred_test),
+        "CV_R2_mean": np.mean(cv_scores),
+        "CV_R2_std": np.std(cv_scores)
+    }
+
+    print(f"{name} best_params: {grid.best_params_}, best_cv_score: {np.mean(cv_scores):.4f}")
+    results.append(result)
+
+# ====================== 构建 Stacking 模型 ======================
+results_df = pd.DataFrame(results).sort_values(by="Test_R2", ascending=False)
+print("\n📊 模型性能汇总（按 Test_R2 排序）:")
+print(results_df[["Model", "Train_R2", "Test_R2", "Train_MAE", "Test_MAE", "CV_R2_mean"]])
+
+top3_models = results_df["Model"].head(3).tolist()
+print(f"\n🔗 构建 StackingRegressor（Top-3 base models -> XGB as final_estimator）\n Top base models: {top3_models}")
+
+base_estimators = [(name, models[name]["model"]) for name in top3_models]
+stacking = StackingRegressor(estimators=base_estimators, final_estimator=XGBRegressor(random_state=42))
+stacking.fit(X_train, y_train)
+
+y_pred_train = stacking.predict(X_train)
+y_pred_test = stacking.predict(X_test)
+
+stacking_result = pd.DataFrame([{
+    "Model": "Stacking",
+    "Train_R2": r2_score(y_train, y_pred_train),
+    "Test_R2": r2_score(y_test, y_pred_test),
+    "Train_RMSE": np.sqrt(mean_squared_error(y_train, y_pred_train)),
+    "Test_RMSE": np.sqrt(mean_squared_error(y_test, y_pred_test))
+}])
+
+results_df = pd.concat([results_df, stacking_result], ignore_index=True)
+
+# ====================== 保存结果 ======================
+results_path = os.path.join(SAVE_FOLDER, "model_performance_summary.csv")
+results_df.to_csv(results_path, index=False)
+print(f"\n✅ 全部结果已保存到：{results_path}")

@@ -1,0 +1,355 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import joblib as jl
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ====================== Configuration ======================
+DATA_PATH = r"E:\桌面\0\ML_ready\HIX_train_ready.csv"
+SAVE_FOLDER = r"E:\桌面\0\ML_ready"
+IMAGE_FOLDER = os.path.join(SAVE_FOLDER, 'best_models_final')
+os.makedirs(IMAGE_FOLDER, exist_ok=True)
+
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+# ====================== Data Loading ======================
+print("Loading data for final optimization...")
+df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+print(f"Data shape: {df.shape}")
+
+# ====================== Feature Engineering ======================
+features = ['PS', 'KOH', 'Microwave', 'R1', 'R2', 'R3', 'R4', 'R5']
+X = df[features].values
+y = df['HIX_normalized'].values
+
+# Scale features
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# PCA
+pca = PCA(n_components=0.92)
+X_pca = pca.fit_transform(X_scaled)
+print(f"Original features: {X.shape[1]}, After PCA: {X_pca.shape[1]}")
+
+# ====================== Dataset Splitting ======================
+X_train, X_test, y_train, y_test = train_test_split(
+    X_pca, y, test_size=0.25, random_state=42
+)
+print(f"Training set: {X_train.shape}, Test set: {X_test.shape}")
+
+# ====================== Final Model Optimization ======================
+# 专门优化两个最佳模型
+final_models = {
+    # 优化版本1: 更平衡的RandomForest
+    "RF_Final_Balanced": RandomForestRegressor(
+        n_estimators=300,
+        max_depth=9,
+        min_samples_split=6,
+        min_samples_leaf=2,
+        max_features=0.7,
+        bootstrap=True,
+        random_state=42,
+        n_jobs=-1
+    ),
+
+    # 优化版本2: 更强的RandomForest
+    "RF_Final_Strong": RandomForestRegressor(
+        n_estimators=350,
+        max_depth=11,
+        min_samples_split=4,
+        min_samples_leaf=1,
+        max_features=0.8,
+        bootstrap=True,
+        random_state=42,
+        n_jobs=-1
+    ),
+
+    # 优化版本1: 控制过拟合的GradientBoosting
+    "GB_Final_Conservative": GradientBoostingRegressor(
+        n_estimators=250,
+        learning_rate=0.04,
+        max_depth=5,
+        min_samples_split=10,
+        min_samples_leaf=4,
+        subsample=0.75,
+        random_state=42
+    ),
+
+    # 优化版本2: 高精度的GradientBoosting
+    "GB_Final_Power": GradientBoostingRegressor(
+        n_estimators=300,
+        learning_rate=0.03,
+        max_depth=6,
+        min_samples_split=6,
+        min_samples_leaf=2,
+        subsample=0.8,
+        random_state=42
+    )
+}
+
+
+# ====================== Advanced Visualization ======================
+def create_final_visualizations(y_train, y_test, y_train_pred, y_test_pred, model_name, folder, model):
+    """Create comprehensive visualizations for final models"""
+
+    # Calculate metrics
+    train_r2 = r2_score(y_train, y_train_pred)
+    test_r2 = r2_score(y_test, y_test_pred)
+    test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+    test_mae = mean_absolute_error(y_test, y_test_pred)
+    overfitting_gap = train_r2 - test_r2
+
+    # Create figure
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+
+    # Plot 1: True vs Predicted
+    axes[0, 0].scatter(y_train, y_train_pred, alpha=0.6, label=f'Train (R²={train_r2:.3f})', color='blue')
+    axes[0, 0].scatter(y_test, y_test_pred, alpha=0.6, label=f'Test (R²={test_r2:.3f})', color='red')
+    min_val = min(y_train.min(), y_test.min())
+    max_val = max(y_train.max(), y_test.max())
+    axes[0, 0].plot([min_val, max_val], [min_val, max_val], 'k--', alpha=0.8, linewidth=2)
+    axes[0, 0].set_xlabel('True HIX_normalized')
+    axes[0, 0].set_ylabel('Predicted HIX_normalized')
+    axes[0, 0].set_title(f'{model_name}\nTrue vs Predicted Values')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+
+    # Plot 2: Residuals
+    train_residuals = y_train - y_train_pred
+    test_residuals = y_test - y_test_pred
+    axes[0, 1].scatter(y_train_pred, train_residuals, alpha=0.6, label='Train', color='blue')
+    axes[0, 1].scatter(y_test_pred, test_residuals, alpha=0.6, label='Test', color='red')
+    axes[0, 1].axhline(y=0, color='k', linestyle='--', linewidth=2)
+    axes[0, 1].set_xlabel('Predicted Values')
+    axes[0, 1].set_ylabel('Residuals')
+    axes[0, 1].set_title(f'{model_name}\nResidual Analysis')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+
+    # Plot 3: Error distribution
+    axes[0, 2].hist(train_residuals, bins=20, alpha=0.7, label='Train Errors', color='blue', density=True)
+    axes[0, 2].hist(test_residuals, bins=20, alpha=0.7, label='Test Errors', color='red', density=True)
+    axes[0, 2].axvline(x=0, color='k', linestyle='--', linewidth=2)
+    axes[0, 2].set_xlabel('Prediction Error')
+    axes[0, 2].set_ylabel('Density')
+    axes[0, 2].set_title(f'{model_name}\nError Distribution')
+    axes[0, 2].legend()
+
+    # Plot 4: Feature importance
+    if hasattr(model, 'feature_importances_'):
+        importances = model.feature_importances_
+        feature_names = [f'PC{i + 1}' for i in range(len(importances))]
+        indices = np.argsort(importances)[::-1]
+
+        top_n = min(7, len(importances))
+        indices = indices[:top_n]
+        top_importances = importances[indices]
+        top_features = [feature_names[i] for i in indices]
+
+        axes[1, 0].barh(range(top_n), top_importances, align="center", color='green', alpha=0.7)
+        axes[1, 0].set_yticks(range(top_n))
+        axes[1, 0].set_yticklabels(top_features)
+        axes[1, 0].set_xlabel('Feature Importance')
+        axes[1, 0].set_title(f'{model_name}\nTop {top_n} Feature Importance')
+
+    # Plot 5: Cumulative error distribution
+    axes[1, 1].hist(np.abs(train_residuals), bins=20, cumulative=True, density=True,
+                    alpha=0.7, label='Train', color='blue', histtype='step', linewidth=2)
+    axes[1, 1].hist(np.abs(test_residuals), bins=20, cumulative=True, density=True,
+                    alpha=0.7, label='Test', color='red', histtype='step', linewidth=2)
+    axes[1, 1].set_xlabel('Absolute Error')
+    axes[1, 1].set_ylabel('Cumulative Probability')
+    axes[1, 1].set_title(f'{model_name}\nCumulative Error Distribution')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+
+    # Plot 6: Performance summary
+    axes[1, 2].axis('off')
+    summary_text = f"""
+    FINAL MODEL PERFORMANCE
+    ======================
+    Model: {model_name}
+
+    Training Performance:
+    - R²: {train_r2:.4f}
+    - RMSE: {np.sqrt(mean_squared_error(y_train, y_train_pred)):.4f}
+
+    Test Performance:
+    - R²: {test_r2:.4f}
+    - RMSE: {test_rmse:.4f}
+    - MAE: {test_mae:.4f}
+
+    Generalization:
+    - Overfitting Gap: {overfitting_gap:.4f}
+    - CV R²: {cross_val_score(model, X_train, y_train, cv=5, scoring='r2').mean():.4f}
+    """
+    axes[1, 2].text(0.05, 0.95, summary_text, transform=axes[1, 2].transAxes,
+                    fontsize=11, verticalalignment='top', fontfamily='monospace',
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray", alpha=0.7))
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(folder, f'{model_name}_final_analysis.png'),
+                dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+# ====================== Final Model Training ======================
+print("\n" + "=" * 60)
+print("FINAL MODEL OPTIMIZATION")
+print("=" * 60)
+
+results = []
+
+for model_name, model in final_models.items():
+    print(f"\nTraining {model_name}...")
+
+    try:
+        # Train model
+        model.fit(X_train, y_train)
+
+        # Make predictions
+        y_train_pred = model.predict(X_train)
+        y_test_pred = model.predict(X_test)
+
+        # Calculate metrics
+        train_r2 = r2_score(y_train, y_train_pred)
+        test_r2 = r2_score(y_test, y_test_pred)
+        train_rmse = np.sqrt(mean_squared_error(y_train, y_train_pred))
+        test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+        train_mae = mean_absolute_error(y_train, y_train_pred)
+        test_mae = mean_absolute_error(y_test, y_test_pred)
+
+        # Cross-validation
+        cv_scores = cross_val_score(model, X_train, y_train, cv=5, scoring='r2')
+        cv_mean = cv_scores.mean()
+        cv_std = cv_scores.std()
+
+        # Calculate overfitting gap and combined score
+        overfitting_gap = train_r2 - test_r2
+        combined_score = test_r2 * (1 - overfitting_gap)
+
+        # Print results
+        print(f"  Train R2: {train_r2:.4f}")
+        print(f"  Test R2:  {test_r2:.4f}")
+        print(f"  Overfitting: {overfitting_gap:.4f}")
+        print(f"  Test RMSE: {test_rmse:.4f}")
+        print(f"  Combined Score: {combined_score:.4f}")
+
+        # Save model
+        jl.dump(model, os.path.join(SAVE_FOLDER, f'{model_name}_final.pkl'))
+
+        # Save predictions
+        pd.DataFrame({'True': y_train, 'Predicted': y_train_pred}).to_csv(
+            os.path.join(SAVE_FOLDER, f'{model_name}_final_train.csv'), index=False
+        )
+        pd.DataFrame({'True': y_test, 'Predicted': y_test_pred}).to_csv(
+            os.path.join(SAVE_FOLDER, f'{model_name}_final_test.csv'), index=False
+        )
+
+        # Create comprehensive visualizations
+        create_final_visualizations(y_train, y_test, y_train_pred, y_test_pred,
+                                    model_name, IMAGE_FOLDER, model)
+
+        # Store results
+        results.append({
+            'Model': model_name,
+            'Train_R2': train_r2,
+            'Test_R2': test_r2,
+            'Train_RMSE': train_rmse,
+            'Test_RMSE': test_rmse,
+            'Train_MAE': train_mae,
+            'Test_MAE': test_mae,
+            'CV_R2_mean': cv_mean,
+            'CV_R2_std': cv_std,
+            'Overfitting_Gap': overfitting_gap,
+            'Combined_Score': combined_score
+        })
+
+    except Exception as e:
+        print(f"  Error with {model_name}: {str(e)}")
+        continue
+
+# ====================== Final Results Analysis ======================
+if results:
+    results_df = pd.DataFrame(results)
+    results_df = results_df.sort_values('Combined_Score', ascending=False)
+
+    print("\n" + "=" * 60)
+    print("FINAL MODEL COMPARISON")
+    print("=" * 60)
+
+    for i, row in results_df.iterrows():
+        of_status = "✓ Low" if row['Overfitting_Gap'] < 0.15 else "○ Moderate" if row[
+                                                                                      'Overfitting_Gap'] < 0.3 else "⚠ High"
+        print(
+            f"{row['Model']:25s} | Test R2: {row['Test_R2']:.4f} | Overfitting: {of_status} | Score: {row['Combined_Score']:.4f}")
+
+    # Best model selection
+    best_model_row = results_df.iloc[0]
+    best_model_name = best_model_row['Model']
+
+    print(f"\n🏆 FINAL RECOMMENDATION: {best_model_name}")
+    print(f"   Test R²: {best_model_row['Test_R2']:.4f}")
+    print(f"   Test RMSE: {best_model_row['Test_RMSE']:.4f}")
+    print(f"   Overfitting Gap: {best_model_row['Overfitting_Gap']:.4f}")
+    print(f"   Combined Score: {best_model_row['Combined_Score']:.4f}")
+
+    # Performance improvement comparison
+    previous_best_r2 = 0.5923
+    improvement = best_model_row['Test_R2'] - previous_best_r2
+    improvement_percent = (improvement / previous_best_r2) * 100
+
+    print(f"\n📈 PERFORMANCE IMPROVEMENT:")
+    print(f"   Previous Best R²: {previous_best_r2:.4f}")
+    print(f"   Current Best R²:  {best_model_row['Test_R2']:.4f}")
+    print(f"   Improvement:      {improvement:+.4f} ({improvement_percent:+.1f}%)")
+
+    # Save final comparison
+    results_df.to_csv(os.path.join(SAVE_FOLDER, 'final_model_comparison.csv'), index=False)
+
+    # Create final comparison plot
+    plt.figure(figsize=(14, 8))
+    models_names = results_df['Model']
+    test_r2 = results_df['Test_R2']
+    overfitting_gaps = results_df['Overfitting_Gap']
+    scores = results_df['Combined_Score']
+
+    x = np.arange(len(models_names))
+    width = 0.25
+
+    plt.bar(x - width, test_r2, width, label='Test R²', alpha=0.8, color='green')
+    plt.bar(x, overfitting_gaps, width, label='Overfitting Gap', alpha=0.8, color='orange')
+    plt.bar(x + width, scores, width, label='Combined Score', alpha=0.8, color='blue')
+
+    plt.xlabel('Models')
+    plt.ylabel('Scores')
+    plt.title('Final Model Performance Comparison\n(Higher Test R² and Combined Score are Better)')
+    plt.xticks(x, models_names, rotation=45, ha='right')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # Add value labels on bars
+    for i, v in enumerate(test_r2):
+        plt.text(i - width, v + 0.01, f'{v:.3f}', ha='center', va='bottom', fontsize=9)
+    for i, v in enumerate(scores):
+        plt.text(i + width, v + 0.01, f'{v:.3f}', ha='center', va='bottom', fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(IMAGE_FOLDER, 'final_comparison_chart.png'),
+                dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"\n✅ FINAL OPTIMIZATION COMPLETE!")
+    print(f"Best model: {best_model_name}")
+    print(f"Test R²: {best_model_row['Test_R2']:.4f}")
+    print(f"All models and visualizations saved in: {SAVE_FOLDER}")
+
+else:
+    print("No models were successfully trained.")

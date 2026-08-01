@@ -1,0 +1,130 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+import xgboost as xgb
+import joblib as jl
+
+# ====================== 路径设置 ======================
+DATA_PATH = r"E:\桌面\try\ML_ready\HIX.csv"
+SAVE_FOLDER = r"E:\桌面\try\ML_ready"
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# ====================== 加载数据 ======================
+df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+print("数据列：", df.columns.tolist())
+print("数据大小：", df.shape)
+
+# ============================================================
+# 使用你 EEM 代码生成的列名（完全对应你的 calc_features 输出）
+# ============================================================
+feature_cols = [
+    "PS", "KOH", "Microwave",
+    "region1", "region2", "region3", "region4", "region5",
+    "region1_pct", "region2_pct", "region3_pct", "region4_pct", "region5_pct",
+    "total_fluorescence"
+]
+
+target_col = "HIX_normalized"
+
+X = df[feature_cols].values
+y = df[target_col].values
+
+# ====================== 特征标准化 ======================
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# ====================== 划分数据集 ======================
+X_train, X_test, y_train, y_test = train_test_split(
+    X_scaled, y, test_size=0.2, random_state=42
+)
+
+# ====================== 模型列表 ======================
+models = {
+    "Ridge": Ridge(alpha=10),
+    "KNN": KNeighborsRegressor(n_neighbors=7, weights="distance"),
+    "SVR": SVR(kernel="rbf", C=1.0, epsilon=0.1),
+    "DecisionTree": DecisionTreeRegressor(max_depth=5, random_state=42),
+    "RandomForest": RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42),
+    "GradientBoosting": GradientBoostingRegressor(n_estimators=200, max_depth=5, learning_rate=0.1),
+    "XGBoost": xgb.XGBRegressor(
+        n_estimators=200, max_depth=5, learning_rate=0.1, n_jobs=-1
+    )
+}
+
+# ====================== 超参数搜索范围 ======================
+param_grid = {
+    "RandomForest": {
+        "n_estimators": [200, 300, 400],
+        "max_depth": [8, 10, 12],
+        "min_samples_split": [2, 5],
+    },
+    "XGBoost": {
+        "n_estimators": [200, 300, 400],
+        "learning_rate": [0.05, 0.1],
+        "max_depth": [4, 5, 6],
+    },
+    "GradientBoosting": {
+        "n_estimators": [200, 300],
+        "learning_rate": [0.05, 0.1],
+        "max_depth": [3, 5]
+    },
+    "KNN": {
+        "n_neighbors": [5, 7, 9],
+        "weights": ["uniform", "distance"]
+    }
+}
+
+# ====================== 训练与评估 ======================
+results = []
+
+for name, model in models.items():
+    print(f"\n========= 训练模型: {name} =========")
+
+    # 网格搜索
+    if name in param_grid:
+        gs = GridSearchCV(model, param_grid[name], cv=5, scoring="r2", n_jobs=1, verbose=1)
+        gs.fit(X_train, y_train)
+        best_model = gs.best_estimator_
+        print(f"最优参数: {gs.best_params_}")
+    else:
+        best_model = model
+        best_model.fit(X_train, y_train)
+
+    # 预测
+    y_train_pred = best_model.predict(X_train)
+    y_test_pred = best_model.predict(X_test)
+
+    # 评估
+    train_r2 = r2_score(y_train, y_train_pred)
+    test_r2 = r2_score(y_test, y_test_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+
+    print(f"Train R2 = {train_r2:.4f}")
+    print(f"Test R2 = {test_r2:.4f}")
+    print(f"RMSE = {rmse:.4f}")
+
+    cv_scores = cross_val_score(best_model, X_train, y_train, cv=5, scoring="r2")
+    cv_mean = cv_scores.mean()
+
+    results.append([name, train_r2, test_r2, cv_mean])
+
+    # 保存模型
+    jl.dump(best_model, os.path.join(SAVE_FOLDER, f"{name}_model.pkl"))
+
+# ====================== 结果输出 ======================
+df_results = pd.DataFrame(results, columns=["Model", "Train_R2", "Test_R2", "CV_R2"])
+df_results = df_results.sort_values("Test_R2", ascending=False)
+
+print("\n========= 最终模型评估结果 =========")
+print(df_results)
+
+df_results.to_csv(os.path.join(SAVE_FOLDER, "model_performance.csv"), index=False, encoding="utf-8-sig")
+print("\n结果已保存。")

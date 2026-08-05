@@ -1,0 +1,164 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+import joblib as jl
+import matplotlib.pyplot as plt
+import seaborn as sns
+import xgboost as xgb
+
+# ====================== Configuration ======================
+DATA_PATH = r"E:\桌面\try\ML_ready\HIX.csv"
+SAVE_FOLDER = r"E:\桌面\try\ML_ready"
+IMAGE_FOLDER = os.path.join(SAVE_FOLDER, 'model_results')
+os.makedirs(IMAGE_FOLDER, exist_ok=True)
+
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+# ===========================================================
+#  功能函数：训练模型 + 网格搜索 + 输出结果
+# ===========================================================
+
+def train_all_models(X_train, X_test, y_train, y_test, suffix=""):
+    """
+    训练所有模型，自动调参，返回结果与模型字典
+    suffix 用于区分 PCA vs No-PCA 版本
+    """
+    print(f"\n================ Training Models ({suffix}) ================")
+
+    # 定义基础模型
+    models = {
+        "RandomForest": RandomForestRegressor(random_state=42),
+        "GradientBoosting": GradientBoostingRegressor(random_state=42),
+        "XGBoost": xgb.XGBRegressor(random_state=42),
+    }
+
+    # 加强版超参数网格（比你之前更强）
+    param_grid = {
+        'RandomForest': {
+            'n_estimators': [200, 400, 600],
+            'max_depth': [8, 12, 16],
+            'min_samples_split': [2, 4],
+            'min_samples_leaf': [1, 2]
+        },
+        'GradientBoosting': {
+            'learning_rate': [0.01, 0.05, 0.1],
+            'n_estimators': [200, 400, 600],
+            'max_depth': [2, 3, 4]
+        },
+        'XGBoost': {
+            'learning_rate': [0.02, 0.05, 0.1],
+            'n_estimators': [200, 400, 600],
+            'max_depth': [3, 4, 5]
+        }
+    }
+
+    results = []
+    best_models = {}
+
+    for model_name, model in models.items():
+        print(f"\nTraining {model_name} ({suffix}) ...")
+
+        grid = GridSearchCV(model, param_grid[model_name], cv=5, scoring='r2', n_jobs=1, verbose=1)
+        grid.fit(X_train, y_train)
+
+        best = grid.best_estimator_
+        best_models[model_name] = best
+
+        print(f"Best params: {grid.best_params_}")
+
+        # 预测
+        y_train_pred = best.predict(X_train)
+        y_test_pred = best.predict(X_test)
+
+        # 指标
+        train_r2 = r2_score(y_train, y_train_pred)
+        test_r2 = r2_score(y_test, y_test_pred)
+
+        # CV
+        cv_scores = cross_val_score(best, X_train, y_train, cv=5, scoring='r2')
+        cv_mean = cv_scores.mean()
+
+        results.append({
+            "Model": model_name + suffix,
+            "Train_R2": train_r2,
+            "Test_R2": test_r2,
+            "CV_R2": cv_mean,
+        })
+
+        # 保存模型
+        jl.dump(best, os.path.join(SAVE_FOLDER, f"{model_name}{suffix}.pkl"))
+
+        # 特征重要性（只有树模型支持）
+        if hasattr(best, "feature_importances_"):
+            fi = pd.DataFrame({
+                "feature": feature_names_current,
+                "importance": best.feature_importances_
+            }).sort_values("importance", ascending=False)
+
+            fi.to_csv(os.path.join(SAVE_FOLDER, f"{model_name}_feature_importance{suffix}.csv"), index=False)
+
+            plt.figure(figsize=(8, 6))
+            sns.barplot(data=fi.head(15), x="importance", y="feature")
+            plt.title(f"Feature Importance: {model_name} {suffix}")
+            plt.tight_layout()
+            plt.savefig(os.path.join(IMAGE_FOLDER, f"{model_name}_FI{suffix}.png"))
+            plt.close()
+
+    return pd.DataFrame(results), best_models
+
+# ===========================================================
+# 1) 读取数据
+# ===========================================================
+df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+
+features = [
+    "PS", "KOH", "Microwave",
+    "region1", "region2", "region3", "region4", "region5",
+    "region1_pct", "region2_pct", "region3_pct", "region4_pct", "region5_pct",
+    "total_fluorescence"
+]
+
+X = df[features].values
+y = df["HIX_normalized"].values
+
+# ===========================================================
+# 2) No-PCA 版本
+# ===========================================================
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+feature_names_current = features.copy()
+
+X_tr, X_te, y_tr, y_te = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+
+results_no_pca, models_no_pca = train_all_models(X_tr, X_te, y_tr, y_te, suffix="_noPCA")
+
+# ===========================================================
+# 3) PCA 版本
+# ===========================================================
+pca = PCA(n_components=0.95)
+X_pca = pca.fit_transform(X_scaled)
+
+feature_names_current = [f"PCA{i+1}" for i in range(X_pca.shape[1])]
+
+X_tr_pca, X_te_pca, y_tr_pca, y_te_pca = train_test_split(X_pca, y, test_size=0.2, random_state=42)
+
+results_pca, models_pca = train_all_models(X_tr_pca, X_te_pca, y_tr_pca, y_te_pca, suffix="_PCA")
+
+# ===========================================================
+# 4) 保存对比
+# ===========================================================
+final_results = pd.concat([results_no_pca, results_pca], ignore_index=True)
+final_results.to_csv(os.path.join(SAVE_FOLDER, "PCA_vs_noPCA_results.csv"), index=False)
+
+print("\n================ FINAL COMPARISON =================")
+print(final_results.sort_values("Test_R2", ascending=False))

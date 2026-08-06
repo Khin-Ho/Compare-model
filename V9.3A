@@ -1,0 +1,354 @@
+# strong_pipeline_fixed.py
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from time import time
+
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, cross_val_score
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, StackingRegressor
+from sklearn.linear_model import Ridge
+from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.pipeline import Pipeline
+from sklearn.feature_selection import SelectFromModel
+
+import xgboost as xgb
+import joblib as jl
+import json
+import warnings
+warnings.filterwarnings("ignore")
+
+RND = 42
+np.random.seed(RND)
+
+# ============================
+# CONFIG
+# ============================
+DATA_PATH = r"E:\MLdata\try\ML_ready\HIX.csv"
+SAVE_FOLDER = r"E:\MLdata\try\ML_ready\strong_models"
+IMAGE_FOLDER = os.path.join(SAVE_FOLDER, "images")
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+os.makedirs(IMAGE_FOLDER, exist_ok=True)
+
+# Features expected in your CSV (modify if needed)
+BASE_FEATURES = [
+    "PS", "KOH", "Microwave",
+    "region1", "region2", "region3", "region4", "region5",
+    "region1_pct", "region2_pct", "region3_pct", "region4_pct", "region5_pct",
+    "total_fluorescence"
+]
+TARGET = "HIX_normalized"
+
+# Hyperparameter search settings
+N_ITER = 40  # RandomizedSearch iterations (used in helper; you pass n_iter explicitly)
+CV = 5
+
+# Feature-selection settings
+TOP_K_FEATURES = 20  # use top-k from RF importances; adjust as needed
+
+# PCA setting for PCA branch
+PCA_VARIANCE = 0.99
+
+# ============================
+# Utility plotting
+# ============================
+def save_plot_fig(fig, name):
+    path = os.path.join(IMAGE_FOLDER, name)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
+def plot_residuals(y_true, y_pred, name_prefix):
+    resid = y_true - y_pred
+    fig, ax = plt.subplots(1,2, figsize=(10,4))
+    sns.scatterplot(x=y_true, y=y_pred, ax=ax[0])
+    ax[0].plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--')
+    ax[0].set_xlabel("True")
+    ax[0].set_ylabel("Pred")
+    ax[0].set_title("True vs Pred")
+
+    sns.histplot(resid, kde=True, ax=ax[1])
+    ax[1].set_title("Residuals")
+    save_plot_fig(fig, f"{name_prefix}_residuals.png")
+
+def plot_feature_importance(names, importances, name_prefix, topn=30):
+    fi = pd.DataFrame({"feature": names, "importance": importances})
+    fi = fi.sort_values("importance", ascending=False).reset_index(drop=True)
+    fi.to_csv(os.path.join(SAVE_FOLDER, f"{name_prefix}_feature_importance.csv"), index=False)
+    fig, ax = plt.subplots(figsize=(8, min(6, 0.25*topn+1)))
+    sns.barplot(data=fi.head(topn), x="importance", y="feature", ax=ax)
+    ax.set_title(f"Feature importance ({name_prefix})")
+    save_plot_fig(fig, f"{name_prefix}_feature_importance.png")
+    return fi
+
+# ============================
+# Load data
+# ============================
+print("Loading data...")
+df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+print("Columns:", df.columns.tolist())
+print("Data shape:", df.shape)
+
+# Basic checks
+missing = df[BASE_FEATURES + [TARGET]].isnull().sum()
+print("Missing per column:\n", missing[missing>0])
+
+# Prepare X, y
+X_raw = df[BASE_FEATURES].copy()
+y = df[TARGET].values
+
+# Fill any remaining NaN (safe fallback)
+X_raw = X_raw.fillna(X_raw.mean())
+
+# ============================
+# Preprocessing: scale base features
+# ============================
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X_raw)
+feature_names_scaled = BASE_FEATURES.copy()
+
+# ============================
+# 1) Create polynomial features (degree=2) - includes interactions and squares
+# ============================
+print("Generating polynomial features (degree=2)...")
+poly = PolynomialFeatures(degree=2, include_bias=False)
+X_poly = poly.fit_transform(X_scaled)
+poly_feature_names = poly.get_feature_names_out(feature_names_scaled)
+print("Polynomial features count:", X_poly.shape[1])
+
+# ============================
+# 2) Quick RF to estimate importances and select top-K features
+# ============================
+print("Quick RandomForest for feature importance (to select top features)...")
+rf_quick = RandomForestRegressor(n_estimators=200, random_state=RND, n_jobs=-1)
+rf_quick.fit(X_poly, y)
+importances = rf_quick.feature_importances_
+# create DF
+fi_df = pd.DataFrame({"feature": poly_feature_names, "importance": importances}).sort_values("importance", ascending=False)
+fi_df.to_csv(os.path.join(SAVE_FOLDER, "quick_rf_feature_importance.csv"), index=False)
+print("Top 10 features (quick RF):")
+print(fi_df.head(10))
+
+# select top-K features
+K = min(TOP_K_FEATURES, X_poly.shape[1])
+top_features = fi_df["feature"].iloc[:K].tolist()
+top_idx = [np.where(poly_feature_names == f)[0][0] for f in top_features]
+
+X_selected = X_poly[:, top_idx]
+selected_feature_names = [poly_feature_names[i] for i in top_idx]
+print(f"Selected top-{K} features shape:", X_selected.shape)
+
+# Save selected feature list
+with open(os.path.join(SAVE_FOLDER, "selected_features.json"), "w", encoding="utf-8") as f:
+    json.dump(selected_feature_names, f, ensure_ascii=False, indent=2)
+
+# ============================
+# 3) Split dataset (use same split for both pipelines)
+# ============================
+X_tr_sel, X_te_sel, y_tr, y_te = train_test_split(X_selected, y, test_size=0.2, random_state=RND)
+print("Train/Test sizes (selected features):", X_tr_sel.shape, X_te_sel.shape)
+
+# ============================
+# MODEL SEARCH SPACES (Randomized)
+# ============================
+rf_param_dist = {
+    "n_estimators": [200, 400, 600, 800],
+    "max_depth": [6, 8, 10, 12, 16],
+    "min_samples_split": [2, 3, 4, 5],
+    "min_samples_leaf": [1, 2, 3],
+    "bootstrap": [True, False]
+}
+gb_param_dist = {
+    "n_estimators": [200, 400, 600, 800],
+    "learning_rate": [0.01, 0.03, 0.05, 0.08, 0.1],
+    "max_depth": [2, 3, 4, 5],
+    "subsample": [0.6, 0.7, 0.8, 1.0]
+}
+xgb_param_dist = {
+    "n_estimators": [200, 400, 600, 800],
+    "learning_rate": [0.01, 0.02, 0.05, 0.08, 0.1],
+    "max_depth": [3, 4, 5, 6],
+    "subsample": [0.6, 0.7, 0.8, 1.0],
+    "colsample_bytree": [0.6, 0.7, 0.8, 1.0],
+    "reg_lambda": [1, 5, 10]
+}
+
+# Helper: run RandomizedSearchCV
+def rand_search(estimator, param_dist, X_train, y_train, n_iter=30, cv=CV, n_jobs=1):
+    rs = RandomizedSearchCV(estimator, param_distributions=param_dist, n_iter=n_iter, cv=cv,
+                            scoring="r2", random_state=RND, n_jobs=n_jobs, verbose=1)
+    rs.fit(X_train, y_train)
+    return rs.best_estimator_, rs.best_params_, rs.best_score_
+
+# ============================
+# 4) Train on No-PCA branch (selected polynomial features)
+# ============================
+print("\n=== NO-PCA BRANCH: training base models on selected polynomial features ===")
+t0 = time()
+best_rf_no, rf_params_no, rf_cv_no = rand_search(RandomForestRegressor(random_state=RND, n_jobs=-1),
+                                                rf_param_dist, X_tr_sel, y_tr, n_iter=30, cv=CV, n_jobs=1)
+print("RF best params:", rf_params_no, "cv_r2:", rf_cv_no)
+
+best_gb_no, gb_params_no, gb_cv_no = rand_search(GradientBoostingRegressor(random_state=RND),
+                                                gb_param_dist, X_tr_sel, y_tr, n_iter=30, cv=CV, n_jobs=1)
+print("GB best params:", gb_params_no, "cv_r2:", gb_cv_no)
+
+best_xgb_no, xgb_params_no, xgb_cv_no = rand_search(xgb.XGBRegressor(objective="reg:squarederror", random_state=RND, n_jobs=-1),
+                                                    xgb_param_dist, X_tr_sel, y_tr, n_iter=30, cv=CV, n_jobs=1)
+print("XGB best params:", xgb_params_no, "cv_r2:", xgb_cv_no)
+t1 = time()
+print("NO-PCA training finished in {:.1f}s".format(t1-t0))
+
+# Evaluate base models on test
+def evaluate_and_report(model, Xtr, ytr, Xte, yte, name_prefix):
+    ytr_pred = model.predict(Xtr)
+    yte_pred = model.predict(Xte)
+    tr_r2 = float(r2_score(ytr, ytr_pred))
+    te_r2 = float(r2_score(yte, yte_pred))
+    te_rmse = float(np.sqrt(mean_squared_error(yte, yte_pred)))
+    print(f"{name_prefix} -> Train R2: {tr_r2:.4f} | Test R2: {te_r2:.4f} | Test RMSE: {te_rmse:.4f}")
+    plot_residuals(yte, yte_pred, name_prefix)
+    return {"train_r2": tr_r2, "test_r2": te_r2, "test_rmse": te_rmse}
+
+res_rf_no = evaluate_and_report(best_rf_no, X_tr_sel, y_tr, X_te_sel, y_te, "RF_noPCA")
+res_gb_no = evaluate_and_report(best_gb_no, X_tr_sel, y_tr, X_te_sel, y_te, "GB_noPCA")
+res_xgb_no = evaluate_and_report(best_xgb_no, X_tr_sel, y_tr, X_te_sel, y_te, "XGB_noPCA")
+
+# Save feature importance from RF_no
+if hasattr(best_rf_no, "feature_importances_"):
+    fi = plot_feature_importance(selected_feature_names, best_rf_no.feature_importances_, "RF_noPCA", topn=TOP_K_FEATURES)
+
+# ============================
+# 5) PCA branch: apply PCA on full polynomial feature set (not only selected)
+# ============================
+print("\n=== PCA BRANCH: PCA on polynomial features (retain {:.2f} variance) ===".format(PCA_VARIANCE))
+pca = PCA(n_components=PCA_VARIANCE, random_state=RND)
+X_poly_scaled = X_poly  # X_poly is already from scaled base features
+X_pca = pca.fit_transform(X_poly_scaled)
+print("PCA produced {} components".format(X_pca.shape[1]))
+X_tr_pca, X_te_pca, y_tr_pca, y_te_pca = train_test_split(X_pca, y, test_size=0.2, random_state=RND)
+
+# Train same models on PCA components
+t0 = time()
+best_rf_pca, rf_params_pca, rf_cv_pca = rand_search(RandomForestRegressor(random_state=RND, n_jobs=-1),
+                                                    rf_param_dist, X_tr_pca, y_tr_pca, n_iter=30, cv=CV, n_jobs=1)
+print("RF_PCA best params:", rf_params_pca, "cv_r2:", rf_cv_pca)
+
+best_gb_pca, gb_params_pca, gb_cv_pca = rand_search(GradientBoostingRegressor(random_state=RND),
+                                                    gb_param_dist, X_tr_pca, y_tr_pca, n_iter=30, cv=CV, n_jobs=1)
+print("GB_PCA best params:", gb_params_pca, "cv_r2:", gb_cv_pca)
+
+best_xgb_pca, xgb_params_pca, xgb_cv_pca = rand_search(xgb.XGBRegressor(objective="reg:squarederror", random_state=RND, n_jobs=-1),
+                                                        xgb_param_dist, X_tr_pca, y_tr_pca, n_iter=30, cv=CV, n_jobs=1)
+print("XGB_PCA best params:", xgb_params_pca, "cv_r2:", xgb_cv_pca)
+t1 = time()
+print("PCA training finished in {:.1f}s".format(t1-t0))
+
+res_rf_pca = evaluate_and_report(best_rf_pca, X_tr_pca, y_tr_pca, X_te_pca, y_te_pca, "RF_PCA")
+res_gb_pca = evaluate_and_report(best_gb_pca, X_tr_pca, y_tr_pca, X_te_pca, y_te_pca, "GB_PCA")
+res_xgb_pca = evaluate_and_report(best_xgb_pca, X_tr_pca, y_tr_pca, X_te_pca, y_te_pca, "XGB_PCA")
+
+# Save PCA explained variance plot
+explained = pca.explained_variance_ratio_.cumsum()
+fig, ax = plt.subplots(figsize=(6,4))
+ax.plot(np.arange(1, len(explained)+1), explained, marker='o')
+ax.set_xlabel("n components")
+ax.set_ylabel("cumulative explained variance")
+ax.set_title("PCA explained variance")
+save_plot_fig(fig, "pca_explained_variance.png")
+
+# ============================
+# 6) Stacking ensemble (use best of No-PCA or PCA base models depending on validation)
+# ============================
+print("\n=== Stacking ensemble ===")
+
+# Decide which base models to use for stacking (pick better of PCA vs No-PCA per model)
+base_estimators = []
+# For RF:
+if res_rf_no['test_r2'] >= res_rf_pca['test_r2']:
+    base_estimators.append(("rf", best_rf_no))
+else:
+    base_estimators.append(("rf", best_rf_pca))
+# For GB:
+if res_gb_no['test_r2'] >= res_gb_pca['test_r2']:
+    base_estimators.append(("gb", best_gb_no))
+else:
+    base_estimators.append(("gb", best_gb_pca))
+# For XGB:
+if res_xgb_no['test_r2'] >= res_xgb_pca['test_r2']:
+    base_estimators.append(("xgb", best_xgb_no))
+else:
+    base_estimators.append(("xgb", best_xgb_pca))
+
+print("Stacking base estimators:", [b[0] for b in base_estimators])
+
+# Prepare training data for stacking: choose the same representation that matched chosen base models.
+chosen_from_no_pca = sum([1 for m in [res_rf_no, res_gb_no, res_xgb_no] if m['test_r2'] >= res_rf_pca['test_r2']])  # rough
+if chosen_from_no_pca >= 2:
+    X_stack_tr = X_tr_sel
+    X_stack_te = X_te_sel
+    y_stack_tr = y_tr
+    y_stack_te = y_te
+    stack_tag = "noPCA"
+else:
+    X_stack_tr = X_tr_pca
+    X_stack_te = X_te_pca
+    y_stack_tr = y_tr_pca
+    y_stack_te = y_te_pca
+    stack_tag = "PCA"
+
+print("Stack training data from:", stack_tag)
+
+meta_estimator = Ridge(alpha=1.0, random_state=RND)
+
+stack = StackingRegressor(estimators=base_estimators, final_estimator=meta_estimator, n_jobs=1, passthrough=False)
+stack.fit(X_stack_tr, y_stack_tr)
+
+# Evaluate stacking
+y_stack_pred = stack.predict(X_stack_te)
+stack_test_r2 = float(r2_score(y_stack_te, y_stack_pred))
+stack_rmse = float(np.sqrt(mean_squared_error(y_stack_te, y_stack_pred)))
+print(f"Stack ({stack_tag}) -> Test R2: {stack_test_r2:.4f} | RMSE: {stack_rmse:.4f}")
+
+# Save stacking model
+jl.dump(stack, os.path.join(SAVE_FOLDER, f"stacking_{stack_tag}.pkl"))
+
+plot_residuals(y_stack_te, y_stack_pred, f"STACK_{stack_tag}")
+
+# ============================
+# 7) Summarize and save results
+# ============================
+summary = {
+    "RF_no": {"params": rf_params_no, "cv": float(rf_cv_no), **res_rf_no},
+    "GB_no": {"params": gb_params_no, "cv": float(gb_cv_no), **res_gb_no},
+    "XGB_no": {"params": xgb_params_no, "cv": float(xgb_cv_no), **res_xgb_no},
+    "RF_pca": {"params": rf_params_pca, "cv": float(rf_cv_pca), **res_rf_pca},
+    "GB_pca": {"params": gb_params_pca, "cv": float(gb_cv_pca), **res_gb_pca},
+    "XGB_pca": {"params": xgb_params_pca, "cv": float(xgb_cv_pca), **res_xgb_pca},
+    "STACK": {"tag": stack_tag, "test_r2": stack_test_r2, "rmse": stack_rmse}
+}
+# Ensure everything JSON-serializable (convert numpy types)
+def _make_serializable(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.floating, np.float32, np.float64)):
+        return float(obj)
+    if isinstance(obj, (np.integer, np.int32, np.int64)):
+        return int(obj)
+    if isinstance(obj, dict):
+        return {k: _make_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_make_serializable(v) for v in obj]
+    return obj
+
+summary_ser = _make_serializable(summary)
+
+pd.DataFrame(summary_ser).T.to_csv(os.path.join(SAVE_FOLDER, "strong_pipeline_summary.csv"))
+with open(os.path.join(SAVE_FOLDER, "strong_pipeline_summary.json"), "w", encoding="utf-8") as f:
+    json.dump(summary_ser, f, ensure_ascii=False, indent=2)
+
+print("\nAll models and results saved in:", SAVE_FOLDER)
+print("Images saved in:", IMAGE_FOLDER)

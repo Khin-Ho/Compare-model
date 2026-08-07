@@ -1,0 +1,246 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, StackingRegressor
+from sklearn.linear_model import Ridge, RidgeCV
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.feature_selection import SelectFromModel
+import xgboost as xgb
+import joblib as jl
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ====================== Configuration ======================
+DATA_PATH = r"E:\MLdata\try\ML_ready\HIX.csv"
+SAVE_FOLDER = r"E:\MLdata\try\ML_ready"
+IMAGE_FOLDER = os.path.join(SAVE_FOLDER, 'model_results')
+os.makedirs(IMAGE_FOLDER, exist_ok=True)
+
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+# ====================== Load data ======================
+df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+print("Loaded:", DATA_PATH, "shape:", df.shape)
+
+# ========== define feature columns ==========
+features = [
+    "PS", "KOH", "Microwave",
+    "region1", "region2", "region3", "region4", "region5",
+    "region1_pct", "region2_pct", "region3_pct", "region4_pct", "region5_pct",
+    "total_fluorescence"
+]
+target_col = "HIX_normalized"
+
+# basic check
+missing = df[features + [target_col]].isnull().sum()
+print("Missing counts:\n", missing[missing > 0])
+
+X_raw = df[features].copy()
+y = df[target_col].values
+
+# ====================== Polynomial features (degree=2) ======================
+print("Generating polynomial features (degree=2)...")
+poly = PolynomialFeatures(degree=2, include_bias=False, interaction_only=False)
+X_poly = poly.fit_transform(X_raw.values)
+poly_feature_names = poly.get_feature_names_out(features)
+
+print("Poly feature count:", X_poly.shape[1])
+
+# ====================== Scale ======================
+scaler = StandardScaler()
+X_poly_scaled = scaler.fit_transform(X_poly)
+
+# ====================== Feature selection via RandomForest importances ======================
+print("Estimating importances with a RandomForest for feature selection...")
+rf_fs = RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1)
+rf_fs.fit(X_poly_scaled, y)
+importances = rf_fs.feature_importances_
+fi_df = pd.DataFrame({"feature": poly_feature_names, "importance": importances})
+fi_df = fi_df.sort_values("importance", ascending=False).reset_index(drop=True)
+fi_df.to_csv(os.path.join(SAVE_FOLDER, "feature_importances_initial.csv"), index=False)
+
+# save plot top 30
+plt.figure(figsize=(8, 10))
+sns.barplot(data=fi_df.head(30), x="importance", y="feature")
+plt.title("Initial Feature Importances (top 30)")
+plt.tight_layout()
+plt.savefig(os.path.join(IMAGE_FOLDER, "initial_feature_importances_top30.png"))
+plt.close()
+
+# Select features above median importance (you can change threshold strategy)
+threshold = np.median(importances)
+selector = SelectFromModel(rf_fs, threshold=threshold, prefit=True)
+X_selected = selector.transform(X_poly_scaled)
+selected_mask = selector.get_support()
+selected_feature_names = list(np.array(poly_feature_names)[selected_mask])
+
+print(f"Selected features count: {X_selected.shape[1]} (threshold=median)")
+
+# Save selected features list
+pd.DataFrame({"selected_feature": selected_feature_names}).to_csv(
+    os.path.join(SAVE_FOLDER, "selected_features.csv"), index=False
+)
+
+# ====================== Prepare two pipelines: No-PCA (selected) and PCA (selected -> PCA) ======================
+# First, split BEFORE PCA to avoid data leakage
+X_train_sel, X_test_sel, y_train, y_test = train_test_split(X_selected, y, test_size=0.2, random_state=42)
+
+# PCA on selected features (fit only on training)
+pca = PCA(n_components=0.99, svd_solver="full")  # keep 99% variance
+X_train_sel_pca = pca.fit_transform(X_train_sel)
+X_test_sel_pca = pca.transform(X_test_sel)
+print("Selected -> PCA dims:", X_train_sel_pca.shape[1])
+
+# ====================== Model definitions and parameter grids ======================
+models_to_tune = {
+    "RandomForest": RandomForestRegressor(random_state=42, n_jobs=-1),
+    "GradientBoosting": GradientBoostingRegressor(random_state=42),
+    "XGBoost": xgb.XGBRegressor(random_state=42, n_jobs=-1, objective="reg:squarederror")
+}
+
+param_grids = {
+    "RandomForest": {
+        "n_estimators": [300, 500],
+        "max_depth": [8, 12],
+        "min_samples_split": [2, 4],
+        "min_samples_leaf": [1, 2]
+    },
+    "GradientBoosting": {
+        "n_estimators": [300, 500],
+        "learning_rate": [0.01, 0.05],
+        "max_depth": [2, 3, 4]
+    },
+    "XGBoost": {
+        "n_estimators": [300, 500],
+        "learning_rate": [0.02, 0.05],
+        "max_depth": [3, 4],
+        "subsample": [0.7, 0.9],
+        "colsample_bytree": [0.7, 0.9]
+    }
+}
+
+# helper to run GridSearch for a given dataset
+def tune_and_eval(model_name, model, param_grid, X_tr, X_te, y_tr, y_te, suffix):
+    print(f"\nTuning {model_name} ({suffix}) ...")
+    gs = GridSearchCV(model, param_grid, cv=5, scoring="r2", n_jobs=1, verbose=1)
+    gs.fit(X_tr, y_tr)
+    best = gs.best_estimator_
+    print("Best params:", gs.best_params_)
+
+    # evaluate
+    y_tr_pred = best.predict(X_tr)
+    y_te_pred = best.predict(X_te)
+    train_r2 = r2_score(y_tr, y_tr_pred)
+    test_r2 = r2_score(y_te, y_te_pred)
+    train_rmse = np.sqrt(mean_squared_error(y_tr, y_tr_pred))
+    test_rmse = np.sqrt(mean_squared_error(y_te, y_te_pred))
+    cv_scores = cross_val_score(best, X_tr, y_tr, cv=5, scoring="r2")
+    cv_mean, cv_std = cv_scores.mean(), cv_scores.std()
+
+    print(f"{model_name} {suffix} -> Train R2: {train_r2:.4f}, Test R2: {test_r2:.4f}, RMSE: {test_rmse:.4f}, CV R2: {cv_mean:.4f} ± {cv_std:.4f}")
+
+    # save model and metrics
+    jl.dump(best, os.path.join(SAVE_FOLDER, f"{model_name}_{suffix}.pkl"))
+
+    return best, {
+        "Model": f"{model_name}_{suffix}",
+        "Train_R2": train_r2,
+        "Test_R2": test_r2,
+        "Train_RMSE": train_rmse,
+        "Test_RMSE": test_rmse,
+        "CV_R2_mean": cv_mean,
+        "CV_R2_std": cv_std
+    }
+
+# ====================== Tune models on No-PCA (selected features) ======================
+results = []
+best_models_no_pca = {}
+
+for name, model in models_to_tune.items():
+    best, metrics = tune_and_eval(name, model, param_grids[name], X_train_sel, X_test_sel, y_train, y_test, "NoPCA")
+    results.append(metrics)
+    best_models_no_pca[name] = best
+
+# ====================== Tune models on PCA version ======================
+best_models_pca = {}
+for name, model in models_to_tune.items():
+    best, metrics = tune_and_eval(name, model, param_grids[name], X_train_sel_pca, X_test_sel_pca, y_train, y_test, "PCA")
+    results.append(metrics)
+    best_models_pca[name] = best
+
+# ====================== Stacking (use best no-PCA models) ======================
+print("\nTraining Stacking ensemble (using best NoPCA models)...")
+estimators = [
+    ('rf', best_models_no_pca['RandomForest']),
+    ('gb', best_models_no_pca['GradientBoosting']),
+    ('xgb', best_models_no_pca['XGBoost'])
+]
+meta_reg = Ridge(alpha=1.0)
+stack = StackingRegressor(estimators=estimators, final_estimator=meta_reg, n_jobs=1, cv=5)
+stack.fit(X_train_sel, y_train)
+y_train_pred = stack.predict(X_train_sel)
+y_test_pred = stack.predict(X_test_sel)
+stack_train_r2 = r2_score(y_train, y_train_pred)
+stack_test_r2 = r2_score(y_test, y_test_pred)
+stack_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+print(f"Stacking -> Train R2: {stack_train_r2:.4f}, Test R2: {stack_test_r2:.4f}, RMSE: {stack_rmse:.4f}")
+jl.dump(stack, os.path.join(SAVE_FOLDER, "stacking_noPCA.pkl"))
+
+results.append({
+    "Model": "Stacking_noPCA",
+    "Train_R2": stack_train_r2,
+    "Test_R2": stack_test_r2,
+    "Train_RMSE": np.nan,
+    "Test_RMSE": stack_rmse,
+    "CV_R2_mean": np.nan,
+    "CV_R2_std": np.nan
+})
+
+# ====================== Save results table ======================
+results_df = pd.DataFrame(results).sort_values("Test_R2", ascending=False)
+results_df.to_csv(os.path.join(SAVE_FOLDER, "model_performance_advanced.csv"), index=False)
+print("\nFinal results:\n", results_df)
+
+# ====================== Plot true vs pred for best model ======================
+best_row = results_df.iloc[0]
+best_name = best_row["Model"]
+print("Best model:", best_name)
+# choose corresponding object
+if best_name.endswith("NoPCA") or best_name == "Stacking_noPCA":
+    if best_name == "Stacking_noPCA":
+        model_for_plot = stack
+        X_te_plot = X_test_sel
+    else:
+        key = best_name.split("_")[0]
+        model_for_plot = best_models_no_pca.get(key)
+        X_te_plot = X_test_sel
+else:
+    key = best_name.split("_")[0]
+    model_for_plot = best_models_pca.get(key)
+    X_te_plot = X_test_sel_pca
+
+y_pred_best = model_for_plot.predict(X_te_plot)
+plt.figure(figsize=(6,6))
+plt.scatter(y_test, y_pred_best, alpha=0.8)
+plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--')
+plt.xlabel("True HIX")
+plt.ylabel("Predicted HIX")
+plt.title(f"True vs Pred - {best_name}")
+plt.tight_layout()
+plt.savefig(os.path.join(IMAGE_FOLDER, f"true_vs_pred_{best_name}.png"))
+plt.close()
+
+# residual plot
+resid = y_test - y_pred_best
+plt.figure(figsize=(6,4))
+sns.histplot(resid, kde=True)
+plt.title(f"Residuals distribution - {best_name}")
+plt.tight_layout()
+plt.savefig(os.path.join(IMAGE_FOLDER, f"resid_{best_name}.png"))
+plt.close()
+
+print("\nAll outputs saved to:", SAVE_FOLDER)

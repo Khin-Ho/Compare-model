@@ -1,0 +1,142 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.decomposition import PCA
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+import joblib as jl
+import matplotlib.pyplot as plt
+import seaborn as sns
+import xgboost as xgb
+
+# ====================== Configuration ======================
+DATA_PATH = r"E:\桌面\6\ML_ready\HIX_train_ready.csv"
+SAVE_FOLDER = r"E:\桌面\6\ML_ready"
+IMAGE_FOLDER = os.path.join(SAVE_FOLDER, 'model_results')
+os.makedirs(IMAGE_FOLDER, exist_ok=True)
+
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+# ====================== Data Loading ======================
+print("Loading data...")
+df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+print(f"Data shape: {df.shape}")
+
+features = ['PS', 'KOH', 'Microwave', 'R1', 'R2', 'R3', 'R4', 'R5']
+X = df[features].values
+y = df['HIX_normalized'].values
+
+print("Checking for missing values...")
+print(df.isnull().sum())
+
+# ====================== Data Preprocessing ======================
+# StandardScaler for linear/non-tree models
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Polynomial features for linear/non-tree models
+poly = PolynomialFeatures(degree=2, include_bias=False)
+X_poly = poly.fit_transform(X_scaled)
+
+# PCA for polynomial features to reduce dimensionality
+pca = PCA(n_components=0.95)
+X_pca = pca.fit_transform(X_poly)
+print(f"Original features: {X.shape[1]}, After Polynomial + PCA: {X_pca.shape[1]}")
+
+# Split dataset
+X_train_pca, X_test_pca, y_train, y_test = train_test_split(X_pca, y, test_size=0.2, random_state=42)
+X_train_raw, X_test_raw, _, _ = train_test_split(X, y, test_size=0.2, random_state=42)
+
+print(f"Training set (PCA): {X_train_pca.shape}, Test set (PCA): {X_test_pca.shape}")
+print(f"Training set (raw): {X_train_raw.shape}, Test set (raw): {X_test_raw.shape}")
+
+# ====================== Model Definitions ======================
+models = {
+    "Ridge": Ridge(),
+    "KNN": KNeighborsRegressor(),
+    "SVR": SVR(),
+    "DecisionTree": DecisionTreeRegressor(random_state=42),
+    "RandomForest": RandomForestRegressor(random_state=42, n_jobs=-1),
+    "GradientBoosting": GradientBoostingRegressor(random_state=42),
+    "XGBoost": xgb.XGBRegressor(random_state=42, n_jobs=-1)
+}
+
+# ====================== Hyperparameter Grids ======================
+param_grid = {
+    'Ridge': {'alpha': [0.1, 1.0, 10.0, 50.0]},
+    'KNN': {'n_neighbors': [3, 5, 7, 9, 11], 'weights': ['uniform', 'distance'], 'p': [1, 2]},
+    'SVR': {'C': [0.1, 1, 10], 'epsilon': [0.01, 0.1, 0.2], 'gamma': ['scale', 'auto']},
+    'DecisionTree': {'max_depth': [3, 5, 7], 'min_samples_split': [2, 5, 10], 'min_samples_leaf': [1, 2, 4]},
+    'RandomForest': {'n_estimators': [100, 200, 300], 'max_depth': [3, 5, 7], 'min_samples_split': [2, 5, 10],
+                     'min_samples_leaf': [2, 4, 6]},
+    'GradientBoosting': {'learning_rate': [0.01, 0.05, 0.1], 'n_estimators': [100, 200, 300], 'max_depth': [3, 5]},
+    'XGBoost': {'learning_rate': [0.01, 0.05, 0.1], 'n_estimators': [100, 200, 300], 'max_depth': [3, 5]}
+}
+
+# ====================== Model Training and Evaluation ======================
+results = []
+
+for model_name, model in models.items():
+    print(f"\nTraining {model_name}...")
+
+    # Decide which features to use
+    if model_name in ['Ridge', 'SVR', 'KNN']:
+        X_train, X_test = X_train_pca, X_test_pca  # Polynomial + PCA features
+    else:
+        X_train, X_test = X_train_raw, X_test_raw  # raw features for tree models
+
+    # GridSearchCV
+    grid_search = GridSearchCV(model, param_grid[model_name], cv=5, scoring='r2', n_jobs=1, verbose=1)
+    grid_search.fit(X_train, y_train)
+    best_model = grid_search.best_estimator_
+    print(f"Best params for {model_name}: {grid_search.best_params_}")
+
+    # Predictions
+    y_train_pred = best_model.predict(X_train)
+    y_test_pred = best_model.predict(X_test)
+
+    train_r2 = r2_score(y_train, y_train_pred)
+    test_r2 = r2_score(y_test, y_test_pred)
+    train_rmse = np.sqrt(mean_squared_error(y_train, y_train_pred))
+    test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+
+    cv_scores = cross_val_score(best_model, X_train, y_train, cv=5, scoring='r2')
+    cv_mean, cv_std = cv_scores.mean(), cv_scores.std()
+
+    print(f"  Train R2: {train_r2:.4f}")
+    print(f"  Test R2: {test_r2:.4f}")
+    print(f"  Test RMSE: {test_rmse:.4f}")
+    print(f"  CV R2: {cv_mean:.4f} ± {cv_std:.4f}")
+
+    jl.dump(best_model, os.path.join(SAVE_FOLDER, f'{model_name}_model.pkl'))
+
+    results.append({
+        'Model': model_name,
+        'Train_R2': train_r2,
+        'Test_R2': test_r2,
+        'Train_RMSE': train_rmse,
+        'Test_RMSE': test_rmse,
+        'CV_R2_mean': cv_mean,
+        'CV_R2_std': cv_std
+    })
+
+# ====================== Results Summary ======================
+results_df = pd.DataFrame(results).sort_values('Test_R2', ascending=False)
+print("\n" + "=" * 60)
+print("FINAL RESULTS SUMMARY")
+print("=" * 60)
+for i, row in results_df.iterrows():
+    print(
+        f"{row['Model']:15s} | Test R2: {row['Test_R2']:.4f} | Train R2: {row['Train_R2']:.4f} | CV R2: {row['CV_R2_mean']:.4f} ± {row['CV_R2_std']:.4f}")
+
+results_path = os.path.join(SAVE_FOLDER, 'model_performance_poly_optimized.csv')
+results_df.to_csv(results_path, index=False)
+print(f"\nResults saved to: {results_path}")
+print(f"\nAll outputs saved in: {SAVE_FOLDER}")

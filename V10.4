@@ -1,0 +1,119 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, GridSearchCV, KFold, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+import xgboost as xgb
+import joblib as jl
+
+DATA_PATH = r"E:\桌面\6\ML_ready\HIX_train_ready.csv"
+SAVE_FOLDER = r"E:\桌面\6\ML_ready"
+
+df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+
+# Features
+features = ['PS', 'KOH', 'Microwave', 'R1', 'R2', 'R3', 'R4', 'R5']
+X = df[features].values
+y = df['HIX_normalized'].values
+
+# Standardize
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Split dataset
+X_train, X_test, y_train, y_test = train_test_split(
+    X_scaled, y, test_size=0.2, random_state=42
+)
+
+# CV setting
+cv = KFold(n_splits=8, shuffle=True, random_state=42)
+
+models = {
+    "Ridge": Ridge(alpha=5.0),
+
+    "KNN": KNeighborsRegressor(
+        n_neighbors=10,
+        weights='distance',
+        p=1
+    ),
+
+    "SVR": SVR(
+        C=2.0,
+        kernel='rbf',
+        epsilon=0.05,
+        gamma='scale'
+    ),
+
+    "DecisionTree": DecisionTreeRegressor(
+        max_depth=4,
+        min_samples_leaf=4,
+        random_state=42
+    ),
+
+    "RandomForest": RandomForestRegressor(
+        n_estimators=300,
+        max_depth=4,
+        min_samples_leaf=3,
+        min_samples_split=5,
+        random_state=42,
+        n_jobs=-1
+    ),
+
+    "GradientBoosting": GradientBoostingRegressor(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=3,
+        subsample=0.7,
+        random_state=42
+    ),
+
+    "XGBoost": xgb.XGBRegressor(
+        n_estimators=300,
+        learning_rate=0.05,
+        max_depth=4,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=0.2,
+        reg_lambda=5,
+        objective='reg:squarederror',
+        random_state=42,
+        n_jobs=1
+    )
+}
+
+print("\n========== Training Models ==========")
+
+results = []
+
+for name, model in models.items():
+    print(f"\nTraining {name}...")
+
+    # Train
+    model.fit(X_train, y_train)
+
+    # Predict
+    y_train_pred = model.predict(X_train)
+    y_test_pred = model.predict(X_test)
+
+    # Metrics
+    train_r2 = r2_score(y_train, y_train_pred)
+    test_r2 = r2_score(y_test, y_test_pred)
+    cv_scores = cross_val_score(model, X_train, y_train, cv=cv, scoring='r2')
+
+    print(f"Train R2: {train_r2:.4f}")
+    print(f"Test R2:  {test_r2:.4f}")
+    print(f"CV Mean:  {cv_scores.mean():.4f}")
+
+    results.append([name, train_r2, test_r2, cv_scores.mean()])
+
+    jl.dump(model, os.path.join(SAVE_FOLDER, f'{name}_best.pkl'))
+
+print("\n======= Final Results =======")
+results_df = pd.DataFrame(results, columns=["Model", "Train_R2", "Test_R2", "CV_R2"])
+print(results_df.sort_values("Test_R2", ascending=False))

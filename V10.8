@@ -1,0 +1,84 @@
+import os
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.ensemble import GradientBoostingRegressor, VotingRegressor
+from xgboost import XGBRegressor
+
+# =========================
+# 数据加载
+# =========================
+DATA_PATH = r'E:\ML_ready\HIX_train_ready.csv'
+df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+
+# 特征和目标
+X = df[['PS','KOH','Microwave','R1','R2','R3','R4','R5']].values
+y = df['HIX_normalized'].values
+
+# 标准化
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# PCA 降维
+pca = PCA(n_components=6)
+X_pca = pca.fit_transform(X_scaled)
+
+# 数据切分
+X_train, X_test, y_train, y_test = train_test_split(X_pca, y, test_size=0.2, random_state=42)
+
+# =========================
+# 模型定义
+# =========================
+ridge = Ridge(alpha=1)
+knn = KNeighborsRegressor(n_neighbors=10, p=1, weights='uniform')
+svr = SVR(C=1.0, epsilon=0.1, kernel='rbf')
+gbr = GradientBoostingRegressor(n_estimators=50, learning_rate=0.01, max_depth=5)
+xgb = XGBRegressor(n_estimators=50, learning_rate=0.05, max_depth=5, subsample=0.7, colsample_bytree=1.0, reg_alpha=0, reg_lambda=10)
+
+voting = VotingRegressor([('ridge', ridge), ('knn', knn), ('svr', svr), ('gbr', gbr), ('xgb', xgb)])
+
+models = {
+    'VotingRegressor': voting,
+    'Ridge': ridge,
+    'KNN': knn,
+    'SVR': svr,
+    'GradientBoosting': gbr,
+    'XGBoost': xgb
+}
+
+# =========================
+# 训练和评估
+# =========================
+results = []
+
+for name, model in models.items():
+    model.fit(X_train, y_train)
+    train_r2 = model.score(X_train, y_train)
+    test_r2 = model.score(X_test, y_test)
+    cv_scores = cross_val_score(model, X_train, y_train, cv=5, scoring='r2')
+    cv_mean = np.mean(cv_scores)
+    cv_std = np.std(cv_scores)
+    results.append({
+        'Model': name,
+        'Train_R2': train_r2,
+        'Test_R2': test_r2,
+        'CV_R2_mean': cv_mean,
+        'CV_R2_std': cv_std
+    })
+    print(f"{name}: Test R2={test_r2:.3f}, Train R2={train_r2:.3f}, CV R2={cv_mean:.3f} ± {cv_std:.3f}")
+
+# =========================
+# 保存结果
+# =========================
+results_df = pd.DataFrame(results)
+output_dir = r'E:\桌面\6\ML_ready'
+os.makedirs(output_dir, exist_ok=True)
+output_file = os.path.join(output_dir, 'model_performance_stable.csv')
+results_df.to_csv(output_file, index=False)
+
+print(f"All outputs saved in: {output_dir}")

@@ -1,0 +1,259 @@
+import os
+import json
+import time
+import logging
+import warnings
+import tempfile
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+# ====================== Windows 中文用户名 + joblib 修复 ======================
+tempfile.tempdir = r"C:\Temp"
+os.makedirs(tempfile.tempdir, exist_ok=True)
+os.environ["JOBLIB_TEMP_FOLDER"] = tempfile.tempdir
+
+import joblib as jl
+import xgboost as xgb
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score, KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import (mean_squared_error, r2_score, mean_absolute_error,
+                             median_absolute_error, max_error)
+
+# ====================== CONFIG 区 ======================
+DATA_PATH = r"E:\桌面\soy\remove dataset for other.xlsx"
+MATERIAL_FILTER = None
+FEATURES = ["PS", "KOH", "R1o", "R2o", "R3o", "R4o", "R5o"]
+TARGET = "HIX"
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+CV_FOLDS = 5
+NESTED_OUTER_FOLDS = 5     # 嵌套 CV 外层折数
+NESTED_INNER_FOLDS = 5     # 嵌套 CV 内层折数（用于选参）
+N_JOBS = -1
+SAVE_TOP_N = 3
+SAVE_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out", "V11.3")
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# ====================== 日志 ======================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(os.path.join(SAVE_FOLDER, "run.log"), encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("V11.3")
+
+
+def log_config():
+    cfg = {
+        "DATA_PATH": DATA_PATH, "MATERIAL_FILTER": MATERIAL_FILTER,
+        "FEATURES": FEATURES, "TARGET": TARGET, "TEST_SIZE": TEST_SIZE,
+        "RANDOM_STATE": RANDOM_STATE, "CV_FOLDS": CV_FOLDS,
+        "NESTED_OUTER_FOLDS": NESTED_OUTER_FOLDS, "NESTED_INNER_FOLDS": NESTED_INNER_FOLDS,
+        "N_JOBS": N_JOBS, "SAVE_TOP_N": SAVE_TOP_N,
+    }
+    with open(os.path.join(SAVE_FOLDER, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    log.info("=" * 60)
+    for k, v in cfg.items():
+        log.info("  %s = %s", k, v)
+    log.info("=" * 60)
+
+
+def load_data():
+    if DATA_PATH.lower().endswith((".xlsx", ".xls")):
+        df = pd.read_excel(DATA_PATH)
+    else:
+        df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+    df = df.rename(columns={"PS(%)": "PS", "KOH(%)": "KOH"})
+    if MATERIAL_FILTER and "Material" in df.columns:
+        df = df[df["Material"].astype(str).str.strip() == MATERIAL_FILTER].copy()
+    for c in FEATURES + [TARGET]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    missing = [c for c in FEATURES + [TARGET] if c not in df.columns]
+    if missing:
+        raise KeyError(f"数据中缺少列: {missing}")
+    df = df.dropna(subset=FEATURES + [TARGET]).reset_index(drop=True)
+    return df
+
+
+def make_pipeline(model):
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        ("pca", PCA(n_components=0.95)),
+        ("model", model),
+    ])
+
+
+def all_metrics(y_true, y_pred):
+    """V11.3 新增：一次算齐 6 个回归指标。"""
+    eps = 1e-6
+    return {
+        "R2": r2_score(y_true, y_pred),
+        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "MAE": mean_absolute_error(y_true, y_pred),
+        "MAPE": float(np.mean(np.abs((y_true - y_pred) / np.maximum(np.abs(y_true), eps))) * 100),
+        "MedAE": median_absolute_error(y_true, y_pred),
+        "MaxError": max_error(y_true, y_pred),
+    }
+
+
+def nested_cv_r2(model, param_grid, X, y):
+    """嵌套交叉验证（V11.3 核心）：外层折只评估、内层折只选参。
+
+    与 V11.0~11.2 的区别：GridSearchCV 在"每一折训练数据"内部重新
+    选参，外层评估折从未参与过参数选择 → 分数无乐观偏差。
+    返回每折 R2（可报告 mean ± std）。
+    """
+    outer = KFold(n_splits=NESTED_OUTER_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    inner = KFold(n_splits=NESTED_INNER_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    gs = GridSearchCV(make_pipeline(model),
+                      {"model__" + k: v for k, v in param_grid.items()},
+                      cv=inner, scoring="r2", n_jobs=N_JOBS)
+    scores = cross_val_score(gs, X, y, cv=outer, scoring="r2", n_jobs=1, error_score="raise")
+    return scores
+
+
+# ====================== 模型（每次调用都建新实例，避免状态串扰）======================
+def build_models():
+    return {
+        "Ridge": Ridge(),
+        "KNN": KNeighborsRegressor(),
+        "SVR": SVR(),
+        "DecisionTree": DecisionTreeRegressor(random_state=RANDOM_STATE),
+        "RandomForest": RandomForestRegressor(random_state=RANDOM_STATE),
+        "GradientBoosting": GradientBoostingRegressor(random_state=RANDOM_STATE),
+        "XGBoost": xgb.XGBRegressor(random_state=RANDOM_STATE),
+    }
+
+
+# 最终模型调参用的完整网格（与 V11.0 一致）
+PARAM_GRID = {
+    'Ridge': {'alpha': [1, 5, 10, 20]},
+    'KNN': {'n_neighbors': [3, 5, 7, 10], 'weights': ['uniform', 'distance'], 'p': [1, 2]},
+    'SVR': {'C': [0.1, 1, 10], 'epsilon': [0.01, 0.1, 0.2], 'kernel': ['rbf', 'linear']},
+    'DecisionTree': {'max_depth': [2, 3, 4, 5], 'min_samples_split': [2, 5, 10], 'min_samples_leaf': [1, 2, 4]},
+    'RandomForest': {'n_estimators': [50, 100, 150], 'max_depth': [3, 5, 7, 10], 'min_samples_split': [2, 5, 10], 'min_samples_leaf': [1, 2, 4]},
+    'GradientBoosting': {'n_estimators': [50, 100, 150], 'learning_rate': [0.01, 0.03, 0.05], 'max_depth': [2, 3, 4, 5]},
+    'XGBoost': {'n_estimators': [50, 100, 150], 'learning_rate': [0.01, 0.03, 0.05], 'max_depth': [2, 3, 4, 5],
+                'subsample': [0.7, 0.8, 1.0], 'colsample_bytree': [0.7, 0.8, 1.0], 'reg_alpha': [0, 0.1, 1], 'reg_lambda': [1, 10]},
+}
+
+# 嵌套 CV 用的精简网格（V11.3 新增：每模型 <=8 组，控制运行时间）
+NESTED_GRID = {
+    'Ridge': {'alpha': [1, 5, 10, 20]},
+    'KNN': {'n_neighbors': [3, 5, 7], 'weights': ['uniform', 'distance']},
+    'SVR': {'C': [0.1, 1, 10], 'epsilon': [0.1], 'kernel': ['rbf']},
+    'DecisionTree': {'max_depth': [3, 4, 5]},
+    'RandomForest': {'n_estimators': [100], 'max_depth': [5, 7, 10], 'min_samples_leaf': [1, 2]},
+    'GradientBoosting': {'n_estimators': [100], 'learning_rate': [0.03, 0.05], 'max_depth': [3, 5]},
+    'XGBoost': {'n_estimators': [100], 'learning_rate': [0.03, 0.05], 'max_depth': [3, 5],
+                'subsample': [0.8, 1.0]},
+}
+
+
+def main():
+    t0 = time.time()
+    log_config()
+
+    # ---------- 数据 ----------
+    log.info("Loading data...")
+    df = load_data()
+    log.info("Data shape: %s", df.shape)
+    X = df[FEATURES]
+    y = df[TARGET].values
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+    log.info("Training set: %s, Test set: %s", X_train.shape, X_test.shape)
+
+    # ---------- 训练与评估 ----------
+    results_path = os.path.join(SAVE_FOLDER, "all_model_results.csv")
+    if os.path.exists(results_path):
+        os.remove(results_path)
+
+    results = []
+    for name, model in build_models().items():
+        t_model = time.time()
+        log.info("\nTraining %s ...", name)
+
+        # 1) 完整网格选最终模型（与 V11.0~11.2 相同的做法）
+        grid = GridSearchCV(make_pipeline(model), {"model__" + k: v for k, v in PARAM_GRID[name].items()},
+                            cv=CV_FOLDS, scoring='r2', n_jobs=N_JOBS, verbose=0)
+        grid.fit(X_train, y_train)
+        best_pipe = grid.best_estimator_
+        best_params = {k.replace("model__", ""): v for k, v in grid.best_params_.items()}
+        log.info("Best params: %s", best_params)
+
+        # 2) 留出测试集指标
+        y_train_pred = best_pipe.predict(X_train)
+        y_test_pred = best_pipe.predict(X_test)
+        train_m = all_metrics(y_train, y_train_pred)
+        test_m = all_metrics(y_test, y_test_pred)
+
+        # 3) 嵌套 CV（V11.3 核心：无偏泛化估计）
+        log.info("Running nested CV (unbiased) ...")
+        nested_scores = nested_cv_r2(build_models()[name], NESTED_GRID[name], X_train, y_train)
+        log.info("Nested CV per-fold R2: %s", np.round(nested_scores, 4))
+
+        elapsed = time.time() - t_model
+        log.info("Train R2: %.4f | Test R2: %.4f | Nested-CV R2: %.4f +/- %.4f (%.1fs)",
+                 train_m["R2"], test_m["R2"], nested_scores.mean(), nested_scores.std(), elapsed)
+
+        result = {
+            'Model': name,
+            'Train_R2': train_m["R2"], 'Test_R2': test_m["R2"],
+            'Test_RMSE': test_m["RMSE"], 'Test_MAE': test_m["MAE"],
+            'Test_MAPE%': test_m["MAPE"], 'Test_MedAE': test_m["MedAE"],
+            'Test_MaxError': test_m["MaxError"],
+            'NestedCV_R2_mean': nested_scores.mean(),
+            'NestedCV_R2_std': nested_scores.std(),
+            'Best_Params': str(best_params),
+            'Time_sec': round(elapsed, 1),
+            'Pipeline': best_pipe,
+        }
+        results.append(result)
+
+        row_df = pd.DataFrame([{k: v for k, v in result.items() if k != 'Pipeline'}])
+        header = not os.path.exists(results_path)
+        row_df.to_csv(results_path, mode='a', header=header, index=False, encoding='utf-8-sig')
+
+    # ---------- 保存最优 Pipeline ----------
+    results_sorted = sorted(results, key=lambda x: x['NestedCV_R2_mean'], reverse=True)
+    top_n = results_sorted[:SAVE_TOP_N]
+    saved_paths = []
+    for i, result in enumerate(top_n):
+        pkl_path = os.path.join(SAVE_FOLDER, f"top_{i + 1}_model_{result['Model']}.pkl")
+        jl.dump(result['Pipeline'], pkl_path)
+        saved_paths.append(pkl_path)
+        log.info("Saved top %d pipeline: %s", i + 1, pkl_path)
+
+    # ---------- 汇总（按嵌套 CV 排序：真实泛化能力）----------
+    results_df = pd.DataFrame([
+        {k: v for k, v in r.items() if k != 'Pipeline'} for r in results_sorted])
+    results_df.to_csv(os.path.join(SAVE_FOLDER, 'top_3_model_performance.csv'),
+                      index=False, encoding='utf-8-sig')
+    log.info("\n===== Final Results (sorted by Nested-CV R2 = unbiased) =====")
+    cols = ['Model', 'Train_R2', 'Test_R2', 'NestedCV_R2_mean', 'NestedCV_R2_std',
+            'Test_RMSE', 'Test_MAE', 'Test_MAPE%']
+    log.info("\n" + results_df[cols].to_string(index=False))
+    log.info("\n提示: 对比 Test_R2 与 NestedCV_R2_mean —— 差距越大，说明")
+    log.info("      原 GridSearchCV + cross_val_score 的乐观偏差越大。")
+    log.info("Total time: %.1f min", (time.time() - t0) / 60)
+    log.info("All outputs saved to: %s", SAVE_FOLDER)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,312 @@
+import os
+import json
+import time
+import logging
+import warnings
+import tempfile
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+# ====================== Windows 中文用户名 + joblib 修复 ======================
+tempfile.tempdir = r"C:\Temp"
+os.makedirs(tempfile.tempdir, exist_ok=True)
+os.environ["JOBLIB_TEMP_FOLDER"] = tempfile.tempdir
+
+import joblib as jl
+import xgboost as xgb
+try:
+    import lightgbm as lgb
+    HAS_LGB = True
+except Exception:
+    HAS_LGB = False
+
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score, KFold
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import (RandomForestRegressor, GradientBoostingRegressor,
+                              ExtraTreesRegressor, AdaBoostRegressor,
+                              HistGradientBoostingRegressor)
+from sklearn.neural_network import MLPRegressor
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import (mean_squared_error, r2_score, mean_absolute_error,
+                             median_absolute_error, max_error)
+
+# ====================== CONFIG 区 ======================
+DATA_PATH = r"E:\桌面\soy\remove dataset for other.xlsx"
+MATERIAL_FILTER = None
+FEATURES = ["PS", "KOH", "R1o", "R2o", "R3o", "R4o", "R5o"]
+TARGET = "HIX"
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+CV_FOLDS = 5
+N_JOBS = -1
+# 实验开关
+RUN_POLY_COMPARE = True      # 实验 A: 多项式特征对比
+RUN_IMPORTANCE = True        # 实验 B: 置换重要性
+RUN_SUBSET_SEARCH = True     # 实验 C: 特征子集搜索
+RUN_CORR = True              # 实验 D: 相关性矩阵
+SAVE_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out", "V11.5")
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(os.path.join(SAVE_FOLDER, "run.log"), encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("V11.5")
+
+
+def log_config():
+    cfg = {
+        "DATA_PATH": DATA_PATH, "MATERIAL_FILTER": MATERIAL_FILTER,
+        "FEATURES": FEATURES, "TARGET": TARGET, "TEST_SIZE": TEST_SIZE,
+        "RANDOM_STATE": RANDOM_STATE, "CV_FOLDS": CV_FOLDS, "N_JOBS": N_JOBS,
+        "RUN_POLY_COMPARE": RUN_POLY_COMPARE, "RUN_IMPORTANCE": RUN_IMPORTANCE,
+        "RUN_SUBSET_SEARCH": RUN_SUBSET_SEARCH, "RUN_CORR": RUN_CORR,
+    }
+    with open(os.path.join(SAVE_FOLDER, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    log.info("=" * 60)
+    for k, v in cfg.items():
+        log.info("  %s = %s", k, v)
+    log.info("=" * 60)
+
+
+def load_data():
+    if DATA_PATH.lower().endswith((".xlsx", ".xls")):
+        df = pd.read_excel(DATA_PATH)
+    else:
+        df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+    df = df.rename(columns={"PS(%)": "PS", "KOH(%)": "KOH"})
+    if MATERIAL_FILTER and "Material" in df.columns:
+        df = df[df["Material"].astype(str).str.strip() == MATERIAL_FILTER].copy()
+    for c in FEATURES + [TARGET]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    missing = [c for c in FEATURES + [TARGET] if c not in df.columns]
+    if missing:
+        raise KeyError(f"数据中缺少列: {missing}")
+    df = df.dropna(subset=FEATURES + [TARGET]).reset_index(drop=True)
+    return df
+
+
+def make_pipeline(model, use_poly=False):
+    """预处理流水线；use_poly=True 时先加二次多项式特征（V11.5 实验 A）。"""
+    steps = []
+    if use_poly:
+        steps.append(("poly", PolynomialFeatures(degree=2, include_bias=False)))
+    steps += [("scaler", StandardScaler()),
+              ("pca", PCA(n_components=0.95)),
+              ("model", model)]
+    return Pipeline(steps)
+
+
+def all_metrics(y_true, y_pred):
+    eps = 1e-6
+    return {
+        "R2": r2_score(y_true, y_pred),
+        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "MAE": mean_absolute_error(y_true, y_pred),
+        "MAPE": float(np.mean(np.abs((y_true - y_pred) / np.maximum(np.abs(y_true), eps))) * 100),
+        "MedAE": median_absolute_error(y_true, y_pred),
+        "MaxError": max_error(y_true, y_pred),
+    }
+
+
+def build_models():
+    models = {
+        "Ridge": Ridge(),
+        "Lasso": Lasso(max_iter=10000),
+        "ElasticNet": ElasticNet(max_iter=10000),
+        "KNN": KNeighborsRegressor(),
+        "SVR": SVR(),
+        "DecisionTree": DecisionTreeRegressor(random_state=RANDOM_STATE),
+        "RandomForest": RandomForestRegressor(random_state=RANDOM_STATE),
+        "ExtraTrees": ExtraTreesRegressor(random_state=RANDOM_STATE),
+        "GradientBoosting": GradientBoostingRegressor(random_state=RANDOM_STATE),
+        "AdaBoost": AdaBoostRegressor(random_state=RANDOM_STATE),
+        "HistGradientBoosting": HistGradientBoostingRegressor(random_state=RANDOM_STATE),
+        "XGBoost": xgb.XGBRegressor(random_state=RANDOM_STATE, verbosity=0),
+        "MLP": MLPRegressor(random_state=RANDOM_STATE, max_iter=1000,
+                            early_stopping=True, n_iter_no_change=20),
+    }
+    if HAS_LGB:
+        models["LightGBM"] = lgb.LGBMRegressor(random_state=RANDOM_STATE, verbosity=-1)
+    return models
+
+
+PARAM_GRID = {
+    'Ridge': {'alpha': [0.1, 1, 5, 10, 20]},
+    'Lasso': {'alpha': [1e-4, 1e-3, 1e-2, 0.1]},
+    'ElasticNet': {'alpha': [1e-3, 1e-2, 0.1], 'l1_ratio': [0.3, 0.5, 0.7]},
+    'KNN': {'n_neighbors': [3, 5, 7, 10], 'weights': ['uniform', 'distance']},
+    'SVR': {'C': [0.1, 1, 10], 'epsilon': [0.05, 0.1, 0.2], 'kernel': ['rbf']},
+    'DecisionTree': {'max_depth': [3, 4, 5, 7], 'min_samples_leaf': [1, 2, 4]},
+    'RandomForest': {'n_estimators': [100, 200], 'max_depth': [5, 7, 10], 'min_samples_leaf': [1, 2]},
+    'ExtraTrees': {'n_estimators': [100, 200], 'max_depth': [5, 7, 10], 'min_samples_leaf': [1, 2]},
+    'GradientBoosting': {'n_estimators': [100, 200], 'learning_rate': [0.03, 0.05], 'max_depth': [3, 5]},
+    'AdaBoost': {'n_estimators': [50, 100], 'learning_rate': [0.05, 0.1, 0.3]},
+    'HistGradientBoosting': {'max_iter': [150, 300], 'learning_rate': [0.05, 0.1],
+                             'max_depth': [3, 5]},
+    'XGBoost': {'n_estimators': [100, 200], 'learning_rate': [0.03, 0.05], 'max_depth': [3, 5],
+                'subsample': [0.8, 1.0]},
+    'LightGBM': {'n_estimators': [100, 200], 'learning_rate': [0.03, 0.05],
+                 'num_leaves': [15, 31]},
+    'MLP': {'hidden_layer_sizes': [(32,), (64,), (32, 16)], 'alpha': [1e-3, 1e-2]},
+}
+
+
+def run_all_models(X_train, X_test, y_train, y_test, use_poly, tag):
+    """14 模型 x GridSearchCV，返回结果 DataFrame（V11.5 抽象成函数以复用）。"""
+    rows = []
+    for name, model in build_models().items():
+        t = time.time()
+        grid = GridSearchCV(make_pipeline(model, use_poly),
+                            {"model__" + k: v for k, v in PARAM_GRID[name].items()},
+                            cv=CV_FOLDS, scoring='r2', n_jobs=N_JOBS, verbose=0)
+        grid.fit(X_train, y_train)
+        best_pipe = grid.best_estimator_
+        test_m = all_metrics(y_test, best_pipe.predict(X_test))
+        rows.append({
+            'Model': name,
+            'Test_R2': test_m["R2"], 'Test_RMSE': test_m["RMSE"],
+            'Test_MAE': test_m["MAE"], 'Test_MAPE%': test_m["MAPE"],
+            'Best_Params': str({k.replace("model__", ""): v for k, v in grid.best_params_.items()}),
+            'Time_sec': round(time.time() - t, 1),
+            'Pipeline': best_pipe,
+        })
+        log.info("[%s] %-20s Test R2: %.4f (%.1fs)",
+                 tag, name, test_m["R2"], time.time() - t)
+    return pd.DataFrame(rows)
+
+
+def experiment_importance(X_train, X_test, y_train, y_test):
+    """实验 B：RF 置换重要性（V11.5 新增）。"""
+    log.info("\n===== 实验 B: 置换重要性 (RandomForest, 无 PCA) =====")
+    rf_no_pca = Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", RandomForestRegressor(n_estimators=200, random_state=RANDOM_STATE)),
+    ])
+    rf_no_pca.fit(X_train, y_train)
+    imp = permutation_importance(rf_no_pca, X_test, y_test,
+                                 n_repeats=20, random_state=RANDOM_STATE, n_jobs=N_JOBS)
+    imp_df = pd.DataFrame({
+        'Feature': FEATURES,
+        'Importance_mean': imp.importances_mean,
+        'Importance_std': imp.importances_std,
+    }).sort_values('Importance_mean', ascending=False).reset_index(drop=True)
+    imp_df.to_csv(os.path.join(SAVE_FOLDER, "permutation_importance.csv"),
+                  index=False, encoding='utf-8-sig')
+    log.info("\n" + imp_df.to_string(index=False))
+    return imp_df, rf_no_pca
+
+
+def experiment_subset_search(X_train, y_train, imp_df):
+    """实验 C：按重要性取前 k 个特征，RF 交叉验证打分（V11.5 新增）。"""
+    log.info("\n===== 实验 C: 特征子集搜索 (前 k 个重要特征, RF) =====")
+    ranked = imp_df['Feature'].tolist()
+    rows = []
+    cv = KFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    for k in range(3, len(ranked) + 1):
+        sub = ranked[:k]
+        pipe = Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", RandomForestRegressor(n_estimators=200, random_state=RANDOM_STATE)),
+        ])
+        scores = cross_val_score(pipe, X_train[sub], y_train, cv=cv,
+                                 scoring='r2', n_jobs=N_JOBS)
+        rows.append({'k': k, 'Features': '+'.join(sub),
+                     'CV_R2_mean': scores.mean(), 'CV_R2_std': scores.std()})
+        log.info("k=%d  %-40s CV R2: %.4f +/- %.4f",
+                 k, '+'.join(sub), scores.mean(), scores.std())
+    sub_df = pd.DataFrame(rows)
+    sub_df.to_csv(os.path.join(SAVE_FOLDER, "feature_subset_search.csv"),
+                  index=False, encoding='utf-8-sig')
+    best = sub_df.loc[sub_df['CV_R2_mean'].idxmax()]
+    log.info("最优子集: k=%d (%s), CV R2 = %.4f",
+             best['k'], best['Features'], best['CV_R2_mean'])
+
+
+def experiment_corr(df):
+    """实验 D：特征相关性矩阵（V11.5 新增）。"""
+    log.info("\n===== 实验 D: 相关性矩阵 =====")
+    corr = df[FEATURES + [TARGET]].corr()
+    corr.to_csv(os.path.join(SAVE_FOLDER, "correlation_matrix.csv"),
+                encoding='utf-8-sig')
+    corr_target = corr[TARGET].drop(TARGET).sort_values(ascending=False)
+    log.info("与 %s 的相关系数:\n%s", TARGET, corr_target.round(4).to_string())
+
+
+def main():
+    t0 = time.time()
+    log_config()
+
+    log.info("Loading data...")
+    df = load_data()
+    log.info("Data shape: %s", df.shape)
+    X = df[FEATURES]
+    y = df[TARGET].values
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+    log.info("Training set: %s, Test set: %s", X_train.shape, X_test.shape)
+
+    # ---------- 实验 A: 多项式特征对比 ----------
+    if RUN_POLY_COMPARE:
+        log.info("\n===== 实验 A: 预处理对比 (Scaler+PCA  vs  Poly+Scaler+PCA) =====")
+        res_pca = run_all_models(X_train, X_test, y_train, y_test, use_poly=False, tag="PCA")
+        res_poly = run_all_models(X_train, X_test, y_train, y_test, use_poly=True, tag="Poly+PCA")
+
+        res_pca.to_csv(os.path.join(SAVE_FOLDER, "model_results_pca.csv"),
+                       index=False, encoding='utf-8-sig')
+        res_poly.to_csv(os.path.join(SAVE_FOLDER, "model_results_poly_pca.csv"),
+                        index=False, encoding='utf-8-sig')
+
+        compare = pd.DataFrame({
+            'Model': res_pca['Model'],
+            'Test_R2_PCA': res_pca['Test_R2'],
+            'Test_R2_Poly+PCA': res_poly['Test_R2'],
+        })
+        compare['Diff'] = compare['Test_R2_Poly+PCA'] - compare['Test_R2_PCA']
+        compare = compare.sort_values('Test_R2_Poly+PCA', ascending=False).reset_index(drop=True)
+        compare.to_csv(os.path.join(SAVE_FOLDER, "poly_compare.csv"),
+                       index=False, encoding='utf-8-sig')
+        log.info("\nPCA vs Poly+PCA 对比 (Diff>0 表示多项式特征有帮助):")
+        log.info("\n" + compare.round(4).to_string(index=False))
+        n_win = int((compare['Diff'] > 0.01).sum())
+        log.info("多项式特征对 %d/%d 个模型有提升(>0.01)", n_win, len(compare))
+        best_pipe = res_poly.iloc[0]['Pipeline']
+    else:
+        best_pipe = None
+
+    # ---------- 实验 B: 置换重要性 ----------
+    imp_df, _ = experiment_importance(X_train, X_test, y_train, y_test) if RUN_IMPORTANCE else (None, None)
+
+    # ---------- 实验 C: 特征子集搜索 ----------
+    if RUN_SUBSET_SEARCH:
+        experiment_subset_search(X_train, y_train, imp_df)
+
+    # ---------- 实验 D: 相关性 ----------
+    if RUN_CORR:
+        experiment_corr(df)
+
+    if best_pipe is not None:
+        jl.dump(best_pipe, os.path.join(SAVE_FOLDER, "best_pipeline.pkl"))
+        log.info("Saved best pipeline: %s", os.path.join(SAVE_FOLDER, "best_pipeline.pkl"))
+
+    log.info("\nTotal time: %.1f min", (time.time() - t0) / 60)
+    log.info("All outputs saved to: %s", SAVE_FOLDER)
+
+
+if __name__ == "__main__":
+    main()

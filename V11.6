@@ -1,0 +1,274 @@
+import os
+import json
+import time
+import logging
+import warnings
+import tempfile
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+# ====================== Windows 中文用户名 + joblib 修复 ======================
+tempfile.tempdir = r"C:\Temp"
+os.makedirs(tempfile.tempdir, exist_ok=True)
+os.environ["JOBLIB_TEMP_FOLDER"] = tempfile.tempdir
+
+import joblib as jl
+import xgboost as xgb
+try:
+    import lightgbm as lgb
+    HAS_LGB = True
+except Exception:
+    HAS_LGB = False
+
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score, KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+from sklearn.base import clone
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import (RandomForestRegressor, GradientBoostingRegressor,
+                              ExtraTreesRegressor, AdaBoostRegressor,
+                              HistGradientBoostingRegressor,
+                              StackingRegressor, VotingRegressor)
+from sklearn.neural_network import MLPRegressor
+from sklearn.metrics import (mean_squared_error, r2_score, mean_absolute_error,
+                             median_absolute_error, max_error)
+
+# ====================== CONFIG 区 ======================
+DATA_PATH = r"E:\桌面\soy\remove dataset for other.xlsx"
+MATERIAL_FILTER = None
+FEATURES = ["PS", "KOH", "R1o", "R2o", "R3o", "R4o", "R5o"]
+TARGET = "HIX"
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+CV_FOLDS = 5
+N_JOBS = -1
+N_BASE = 5                      # 集成使用的基学习器数量（取 top N 个单模型）
+SAVE_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out", "V11.6")
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(os.path.join(SAVE_FOLDER, "run.log"), encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("V11.6")
+
+
+def log_config():
+    cfg = {
+        "DATA_PATH": DATA_PATH, "MATERIAL_FILTER": MATERIAL_FILTER,
+        "FEATURES": FEATURES, "TARGET": TARGET, "TEST_SIZE": TEST_SIZE,
+        "RANDOM_STATE": RANDOM_STATE, "CV_FOLDS": CV_FOLDS,
+        "N_JOBS": N_JOBS, "N_BASE": N_BASE,
+    }
+    with open(os.path.join(SAVE_FOLDER, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    log.info("=" * 60)
+    for k, v in cfg.items():
+        log.info("  %s = %s", k, v)
+    log.info("=" * 60)
+
+
+def load_data():
+    if DATA_PATH.lower().endswith((".xlsx", ".xls")):
+        df = pd.read_excel(DATA_PATH)
+    else:
+        df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+    df = df.rename(columns={"PS(%)": "PS", "KOH(%)": "KOH"})
+    if MATERIAL_FILTER and "Material" in df.columns:
+        df = df[df["Material"].astype(str).str.strip() == MATERIAL_FILTER].copy()
+    for c in FEATURES + [TARGET]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    missing = [c for c in FEATURES + [TARGET] if c not in df.columns]
+    if missing:
+        raise KeyError(f"数据中缺少列: {missing}")
+    df = df.dropna(subset=FEATURES + [TARGET]).reset_index(drop=True)
+    return df
+
+
+def make_pipeline(model):
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        ("pca", PCA(n_components=0.95)),
+        ("model", model),
+    ])
+
+
+def all_metrics(y_true, y_pred):
+    eps = 1e-6
+    return {
+        "R2": r2_score(y_true, y_pred),
+        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "MAE": mean_absolute_error(y_true, y_pred),
+        "MAPE": float(np.mean(np.abs((y_true - y_pred) / np.maximum(np.abs(y_true), eps))) * 100),
+        "MedAE": median_absolute_error(y_true, y_pred),
+        "MaxError": max_error(y_true, y_pred),
+    }
+
+
+def build_models():
+    models = {
+        "Ridge": Ridge(),
+        "Lasso": Lasso(max_iter=10000),
+        "ElasticNet": ElasticNet(max_iter=10000),
+        "KNN": KNeighborsRegressor(),
+        "SVR": SVR(),
+        "DecisionTree": DecisionTreeRegressor(random_state=RANDOM_STATE),
+        "RandomForest": RandomForestRegressor(random_state=RANDOM_STATE),
+        "ExtraTrees": ExtraTreesRegressor(random_state=RANDOM_STATE),
+        "GradientBoosting": GradientBoostingRegressor(random_state=RANDOM_STATE),
+        "AdaBoost": AdaBoostRegressor(random_state=RANDOM_STATE),
+        "HistGradientBoosting": HistGradientBoostingRegressor(random_state=RANDOM_STATE),
+        "XGBoost": xgb.XGBRegressor(random_state=RANDOM_STATE, verbosity=0),
+        "MLP": MLPRegressor(random_state=RANDOM_STATE, max_iter=1000,
+                            early_stopping=True, n_iter_no_change=20),
+    }
+    if HAS_LGB:
+        models["LightGBM"] = lgb.LGBMRegressor(random_state=RANDOM_STATE, verbosity=-1)
+    return models
+
+
+PARAM_GRID = {
+    'Ridge': {'alpha': [0.1, 1, 5, 10, 20]},
+    'Lasso': {'alpha': [1e-4, 1e-3, 1e-2, 0.1]},
+    'ElasticNet': {'alpha': [1e-3, 1e-2, 0.1], 'l1_ratio': [0.3, 0.5, 0.7]},
+    'KNN': {'n_neighbors': [3, 5, 7, 10], 'weights': ['uniform', 'distance']},
+    'SVR': {'C': [0.1, 1, 10], 'epsilon': [0.05, 0.1, 0.2], 'kernel': ['rbf']},
+    'DecisionTree': {'max_depth': [3, 4, 5, 7], 'min_samples_leaf': [1, 2, 4]},
+    'RandomForest': {'n_estimators': [100, 200], 'max_depth': [5, 7, 10], 'min_samples_leaf': [1, 2]},
+    'ExtraTrees': {'n_estimators': [100, 200], 'max_depth': [5, 7, 10], 'min_samples_leaf': [1, 2]},
+    'GradientBoosting': {'n_estimators': [100, 200], 'learning_rate': [0.03, 0.05], 'max_depth': [3, 5]},
+    'AdaBoost': {'n_estimators': [50, 100], 'learning_rate': [0.05, 0.1, 0.3]},
+    'HistGradientBoosting': {'max_iter': [150, 300], 'learning_rate': [0.05, 0.1],
+                             'max_depth': [3, 5]},
+    'XGBoost': {'n_estimators': [100, 200], 'learning_rate': [0.03, 0.05], 'max_depth': [3, 5],
+                'subsample': [0.8, 1.0]},
+    'LightGBM': {'n_estimators': [100, 200], 'learning_rate': [0.03, 0.05],
+                 'num_leaves': [15, 31]},
+    'MLP': {'hidden_layer_sizes': [(32,), (64,), (32, 16)], 'alpha': [1e-3, 1e-2]},
+}
+
+
+def main():
+    t0 = time.time()
+    log_config()
+
+    log.info("Loading data...")
+    df = load_data()
+    log.info("Data shape: %s", df.shape)
+    X = df[FEATURES]
+    y = df[TARGET].values
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+    log.info("Training set: %s, Test set: %s", X_train.shape, X_test.shape)
+
+    # ---------- 第一步：14 个单模型调参（与 V11.4 相同）----------
+    results_path = os.path.join(SAVE_FOLDER, "single_model_results.csv")
+    if os.path.exists(results_path):
+        os.remove(results_path)
+
+    single_results = []
+    for name, model in build_models().items():
+        t = time.time()
+        grid = GridSearchCV(make_pipeline(model),
+                            {"model__" + k: v for k, v in PARAM_GRID[name].items()},
+                            cv=CV_FOLDS, scoring='r2', n_jobs=N_JOBS, verbose=0)
+        grid.fit(X_train, y_train)
+        best_pipe = grid.best_estimator_
+        test_m = all_metrics(y_test, best_pipe.predict(X_test))
+        single_results.append({
+            'Model': name, 'Test_R2': test_m["R2"], 'Test_RMSE': test_m["RMSE"],
+            'Test_MAE': test_m["MAE"], 'Test_MAPE%': test_m["MAPE"],
+            'Best_Params': str({k.replace("model__", ""): v for k, v in grid.best_params_.items()}),
+            'Pipeline': best_pipe,
+        })
+        log.info("%-20s Test R2: %.4f (%.1fs)", name, test_m["R2"], time.time() - t)
+        row_df = pd.DataFrame([{k: v for k, v in single_results[-1].items() if k != 'Pipeline'}])
+        row_df.to_csv(results_path, mode='a',
+                      header=not os.path.exists(results_path), index=False, encoding='utf-8-sig')
+
+    single_results.sort(key=lambda x: x['Test_R2'], reverse=True)
+    best_single = single_results[0]
+
+    # ---------- 第二步：三种集成（V11.6 核心）----------
+    base_names = [r['Model'] for r in single_results[:N_BASE]]
+    base_pipes = [r['Pipeline'] for r in single_results[:N_BASE]]
+    log.info("\nTop %d 基学习器: %s", N_BASE, base_names)
+
+    # 1) Stacking: 基模型 out-of-fold 预测 + 原始预测( passthrough ) -> Ridge 元学习器
+    stack = StackingRegressor(
+        estimators=[(name, clone(pipe)) for name, pipe in zip(base_names, base_pipes)],
+        final_estimator=Ridge(alpha=1.0), cv=5, passthrough=True, n_jobs=N_JOBS)
+    stack.fit(X_train, y_train)
+
+    # 2) Voting: 简单平均
+    voting = VotingRegressor(
+        estimators=[(name, clone(pipe)) for name, pipe in zip(base_names, base_pipes)],
+        n_jobs=N_JOBS)
+    voting.fit(X_train, y_train)
+
+    # 3) Top3 手工平均（最朴素的集成）
+    top3_pipes = [r['Pipeline'] for r in single_results[:3]]
+    top3_names = [r['Model'] for r in single_results[:3]]
+
+    def top3_avg_predict(X_df):
+        preds = np.column_stack([p.predict(X_df) for p in top3_pipes])
+        return preds.mean(axis=1)
+
+    # ---------- 第三步：集成 vs 最优单模型 对照 ----------
+    log.info("\n===== 集成 vs 最优单模型 =====")
+    compare_rows = []
+
+    def record(tag, y_pred_train, y_pred_test, obj=None, extra=None):
+        tr = all_metrics(y_train, y_pred_train)
+        te = all_metrics(y_test, y_pred_test)
+        cv_s = cross_val_score(obj, X_train, y_train, cv=CV_FOLDS,
+                               scoring='r2', n_jobs=N_JOBS) if obj is not None else None
+        row = {'Model': tag,
+               'Train_R2': tr["R2"], 'Test_R2': te["R2"],
+               'Test_RMSE': te["RMSE"], 'Test_MAE': te["MAE"], 'Test_MAPE%': te["MAPE"],
+               'CV_R2_mean': cv_s.mean() if cv_s is not None else np.nan}
+        if extra:
+            row.update(extra)
+        compare_rows.append(row)
+        log.info("%-28s Train R2: %.4f | Test R2: %.4f%s",
+                 tag, tr["R2"], te["R2"],
+                 f" | CV R2: {cv_s.mean():.4f} +/- {cv_s.std():.4f}" if cv_s is not None else "")
+
+    record(f"Best single ({best_single['Model']})",
+           best_single['Pipeline'].predict(X_train), best_single['Pipeline'].predict(X_test))
+    record(f"Stacking (top{N_BASE}+Ridge)", stack.predict(X_train), stack.predict(X_test),
+           obj=stack, extra={'Members': '+'.join(base_names)})
+    record(f"Voting avg (top{N_BASE})", voting.predict(X_train), voting.predict(X_test),
+           obj=voting, extra={'Members': '+'.join(base_names)})
+    record(f"Avg (top3)", top3_avg_predict(X_train), top3_avg_predict(X_test),
+           extra={'Members': '+'.join(top3_names)})
+
+    compare_df = pd.DataFrame(compare_rows)
+    compare_df.to_csv(os.path.join(SAVE_FOLDER, "ensemble_vs_single.csv"),
+                      index=False, encoding='utf-8-sig')
+
+    # ---------- 保存集成模型 ----------
+    jl.dump(stack, os.path.join(SAVE_FOLDER, "ensemble_stacking.pkl"))
+    jl.dump(voting, os.path.join(SAVE_FOLDER, "ensemble_voting.pkl"))
+    log.info("Saved: ensemble_stacking.pkl / ensemble_voting.pkl")
+
+    log.info("\n===== 最终对照表 =====")
+    log.info("\n" + compare_df.drop(columns=['Members']).round(4).to_string(index=False))
+    log.info("Total time: %.1f min", (time.time() - t0) / 60)
+    log.info("All outputs saved to: %s", SAVE_FOLDER)
+
+
+if __name__ == "__main__":
+    main()

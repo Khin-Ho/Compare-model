@@ -1,0 +1,324 @@
+import os
+import json
+import time
+import logging
+import warnings
+import tempfile
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+# ====================== Windows 中文用户名 + joblib 修复 ======================
+tempfile.tempdir = r"C:\Temp"
+os.makedirs(tempfile.tempdir, exist_ok=True)
+os.environ["JOBLIB_TEMP_FOLDER"] = tempfile.tempdir
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import joblib as jl
+import xgboost as xgb
+try:
+    import lightgbm as lgb
+    HAS_LGB = True
+except Exception:
+    HAS_LGB = False
+
+from sklearn.model_selection import train_test_split, GridSearchCV, KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import (RandomForestRegressor, GradientBoostingRegressor,
+                              ExtraTreesRegressor, AdaBoostRegressor,
+                              HistGradientBoostingRegressor)
+from sklearn.neural_network import MLPRegressor
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import mean_squared_error, r2_score
+
+# ====================== CONFIG 区 ======================
+DATA_PATH = r"E:\桌面\soy\remove dataset for other.xlsx"
+MATERIAL_FILTER = None
+FEATURES = ["PS", "KOH", "R1o", "R2o", "R3o", "R4o", "R5o"]
+TARGET = "HIX"
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+CV_FOLDS = 5
+N_JOBS = -1
+TOP_N_PLOT = 4                   # 图 1 展示前几个模型
+SAVE_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out", "V11.8")
+FIGS_DIR = os.path.join(SAVE_FOLDER, "figs")
+os.makedirs(FIGS_DIR, exist_ok=True)
+
+# ---- 绘图配色（色盲安全；中性墨色文字）----
+INK = "#0b0b0b"
+MUTED = "#898781"
+GRID = "#e1e0d9"
+SPINE = "#c3c2b7"
+SURFACE = "#fcfcfb"
+BLUE = "#2a78d6"      # 分类色 1
+ORANGE = "#eb6834"    # 分类色 2
+
+plt.rcParams.update({
+    "figure.facecolor": SURFACE, "axes.facecolor": SURFACE,
+    "text.color": INK, "axes.labelcolor": INK,
+    "xtick.color": MUTED, "ytick.color": MUTED,
+    "axes.edgecolor": SPINE, "grid.color": GRID,
+    "font.size": 10, "axes.titlesize": 11,
+})
+
+
+def style_axes(ax):
+    """浅色参考网格 + 去掉上/右边框（规范：弱化网格与轴线）。"""
+    ax.grid(True, color=GRID, lw=0.8)
+    ax.set_axisbelow(True)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(os.path.join(SAVE_FOLDER, "run.log"), encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("V11.8")
+
+
+def log_config():
+    cfg = {
+        "DATA_PATH": DATA_PATH, "MATERIAL_FILTER": MATERIAL_FILTER,
+        "FEATURES": FEATURES, "TARGET": TARGET, "TEST_SIZE": TEST_SIZE,
+        "RANDOM_STATE": RANDOM_STATE, "CV_FOLDS": CV_FOLDS,
+        "N_JOBS": N_JOBS, "TOP_N_PLOT": TOP_N_PLOT,
+    }
+    with open(os.path.join(SAVE_FOLDER, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    log.info("=" * 60)
+    for k, v in cfg.items():
+        log.info("  %s = %s", k, v)
+    log.info("=" * 60)
+
+
+def load_data():
+    if DATA_PATH.lower().endswith((".xlsx", ".xls")):
+        df = pd.read_excel(DATA_PATH)
+    else:
+        df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+    df = df.rename(columns={"PS(%)": "PS", "KOH(%)": "KOH"})
+    if MATERIAL_FILTER and "Material" in df.columns:
+        df = df[df["Material"].astype(str).str.strip() == MATERIAL_FILTER].copy()
+    for c in FEATURES + [TARGET]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    missing = [c for c in FEATURES + [TARGET] if c not in df.columns]
+    if missing:
+        raise KeyError(f"数据中缺少列: {missing}")
+    df = df.dropna(subset=FEATURES + [TARGET]).reset_index(drop=True)
+    return df
+
+
+def make_pipeline(model):
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        ("pca", PCA(n_components=0.95)),
+        ("model", model),
+    ])
+
+
+def build_models():
+    models = {
+        "Ridge": Ridge(),
+        "Lasso": Lasso(max_iter=10000),
+        "ElasticNet": ElasticNet(max_iter=10000),
+        "KNN": KNeighborsRegressor(),
+        "SVR": SVR(),
+        "DecisionTree": DecisionTreeRegressor(random_state=RANDOM_STATE),
+        "RandomForest": RandomForestRegressor(random_state=RANDOM_STATE),
+        "ExtraTrees": ExtraTreesRegressor(random_state=RANDOM_STATE),
+        "GradientBoosting": GradientBoostingRegressor(random_state=RANDOM_STATE),
+        "AdaBoost": AdaBoostRegressor(random_state=RANDOM_STATE),
+        "HistGradientBoosting": HistGradientBoostingRegressor(random_state=RANDOM_STATE),
+        "XGBoost": xgb.XGBRegressor(random_state=RANDOM_STATE, verbosity=0),
+        "MLP": MLPRegressor(random_state=RANDOM_STATE, max_iter=1000,
+                            early_stopping=True, n_iter_no_change=20),
+    }
+    if HAS_LGB:
+        models["LightGBM"] = lgb.LGBMRegressor(random_state=RANDOM_STATE, verbosity=-1)
+    return models
+
+
+PARAM_GRID = {
+    'Ridge': {'alpha': [0.1, 1, 5, 10, 20]},
+    'Lasso': {'alpha': [1e-4, 1e-3, 1e-2, 0.1]},
+    'ElasticNet': {'alpha': [1e-3, 1e-2, 0.1], 'l1_ratio': [0.3, 0.5, 0.7]},
+    'KNN': {'n_neighbors': [3, 5, 7, 10], 'weights': ['uniform', 'distance']},
+    'SVR': {'C': [0.1, 1, 10], 'epsilon': [0.05, 0.1, 0.2], 'kernel': ['rbf']},
+    'DecisionTree': {'max_depth': [3, 4, 5, 7], 'min_samples_leaf': [1, 2, 4]},
+    'RandomForest': {'n_estimators': [100, 200], 'max_depth': [5, 7, 10], 'min_samples_leaf': [1, 2]},
+    'ExtraTrees': {'n_estimators': [100, 200], 'max_depth': [5, 7, 10], 'min_samples_leaf': [1, 2]},
+    'GradientBoosting': {'n_estimators': [100, 200], 'learning_rate': [0.03, 0.05], 'max_depth': [3, 5]},
+    'AdaBoost': {'n_estimators': [50, 100], 'learning_rate': [0.05, 0.1, 0.3]},
+    'HistGradientBoosting': {'max_iter': [150, 300], 'learning_rate': [0.05, 0.1],
+                             'max_depth': [3, 5]},
+    'XGBoost': {'n_estimators': [100, 200], 'learning_rate': [0.03, 0.05], 'max_depth': [3, 5],
+                'subsample': [0.8, 1.0]},
+    'LightGBM': {'n_estimators': [100, 200], 'learning_rate': [0.03, 0.05],
+                 'num_leaves': [15, 31]},
+    'MLP': {'hidden_layer_sizes': [(32,), (64,), (32, 16)], 'alpha': [1e-3, 1e-2]},
+}
+
+
+def save_fig(fig, name):
+    path = os.path.join(FIGS_DIR, name)
+    fig.tight_layout()
+    fig.savefig(path, dpi=300, facecolor=SURFACE)
+    plt.close(fig)
+    log.info("Saved figure: %s", path)
+
+
+def fig_parity(top_results):
+    """图 1：top4 模型 预测 vs 实测（含 1:1 线、R2/RMSE 标注）。"""
+    n = min(TOP_N_PLOT, len(top_results))
+    fig, axes = plt.subplots(2, 2, figsize=(9.5, 8))
+    for ax, r in zip(axes.ravel(), top_results[:n]):
+        style_axes(ax)
+        y_true, y_pred = r['y_test'], r['y_pred_test']
+        ax.scatter(y_true, y_pred, s=16, color=BLUE, alpha=0.6, linewidths=0, zorder=2)
+        vmin = min(y_true.min(), y_pred.min())
+        vmax = max(y_true.max(), y_pred.max())
+        pad = (vmax - vmin) * 0.06
+        ax.plot([vmin - pad, vmax + pad], [vmin - pad, vmax + pad],
+                "--", color=INK, lw=1.4, zorder=3)  # 1:1 参考线（中性墨色）
+        ax.set_xlim(vmin - pad, vmax + pad)
+        ax.set_ylim(vmin - pad, vmax + pad)
+        ax.set_xlabel("Measured HIX")
+        ax.set_ylabel("Predicted HIX")
+        ax.set_title(r['Model'], fontsize=11)
+        ax.text(0.03, 0.97,
+                f"R2 = {r['Test_R2']:.3f}\nRMSE = {r['Test_RMSE']:.3f}",
+                transform=ax.transAxes, va="top", ha="left", fontsize=9, color=INK,
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=GRID, alpha=0.9))
+    save_fig(fig, "parity_top4.png")
+
+
+def fig_residual(best):
+    """图 2：最优模型残差图（残差 vs 预测值，检验误差随机性）。"""
+    fig, ax = plt.subplots(figsize=(6.5, 4.6))
+    style_axes(ax)
+    resid = best['y_test'] - best['y_pred_test']
+    ax.axhline(0, color=INK, lw=1.2, ls="--", zorder=3)
+    ax.scatter(best['y_pred_test'], resid, s=16, color=ORANGE, alpha=0.6,
+               linewidths=0, zorder=2)
+    ax.set_xlabel("Predicted HIX")
+    ax.set_ylabel("Residual (Measured - Predicted)")
+    ax.set_title(f"Residuals - {best['Model']}", fontsize=11)
+    ax.text(0.03, 0.03,
+            f"MAE = {best['Test_MAE']:.3f}\nMax error = {best['Test_MaxError']:.3f}",
+            transform=ax.transAxes, va="bottom", ha="left", fontsize=9, color=INK,
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=GRID, alpha=0.9))
+    save_fig(fig, "residual_best.png")
+
+
+def fig_r2_comparison(results):
+    """图 3：14 模型 Test R2 横向条形图（单系列单色，直接标注数值）。"""
+    rows = sorted(results, key=lambda x: x['Test_R2'])
+    fig, ax = plt.subplots(figsize=(7.5, 6.5))
+    style_axes(ax)
+    y_pos = np.arange(len(rows))
+    ax.barh(y_pos, [r['Test_R2'] for r in rows], height=0.6, color=BLUE)
+    for yi, r in zip(y_pos, rows):
+        ax.text(r['Test_R2'] + 0.004, yi, f"{r['Test_R2']:.3f}",
+                va="center", ha="left", fontsize=8.5, color=INK)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels([r['Model'] for r in rows], fontsize=9)
+    ax.set_xlabel("Test R2")
+    ax.set_title("Model comparison (Test R2)", fontsize=11)
+    save_fig(fig, "r2_comparison.png")
+
+
+def fig_importance(X_train, X_test, y_train, y_test):
+    """图 4：RF 置换重要性（无 PCA、可解释到原始特征，含误差棒）。"""
+    rf = Pipeline([("scaler", StandardScaler()),
+                   ("model", RandomForestRegressor(n_estimators=200,
+                                                   random_state=RANDOM_STATE))])
+    rf.fit(X_train, y_train)
+    imp = permutation_importance(rf, X_test, y_test, n_repeats=20,
+                                 random_state=RANDOM_STATE, n_jobs=N_JOBS)
+    order = np.argsort(imp.importances_mean)
+    fig, ax = plt.subplots(figsize=(7.5, 5.2))
+    style_axes(ax)
+    ax.barh(np.arange(len(FEATURES)), imp.importances_mean[order],
+            xerr=imp.importances_std[order], height=0.6,
+            color=BLUE, capsize=3, error_kw=dict(ecolor=INK, lw=0.9))
+    ax.set_yticks(np.arange(len(FEATURES)))
+    ax.set_yticklabels([FEATURES[i] for i in order], fontsize=9)
+    ax.set_xlabel("Permutation importance (R2 decrease)")
+    ax.set_title("Feature importance (RandomForest)", fontsize=11)
+    save_fig(fig, "importance.png")
+
+
+def main():
+    t0 = time.time()
+    log_config()
+
+    log.info("Loading data...")
+    df = load_data()
+    log.info("Data shape: %s", df.shape)
+    X = df[FEATURES]
+    y = df[TARGET].values
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+
+    # ---------- 14 模型调参（与 V11.4 相同）----------
+    results = []
+    for name, model in build_models().items():
+        t = time.time()
+        grid = GridSearchCV(make_pipeline(model),
+                            {"model__" + k: v for k, v in PARAM_GRID[name].items()},
+                            cv=CV_FOLDS, scoring='r2', n_jobs=N_JOBS, verbose=0)
+        grid.fit(X_train, y_train)
+        pipe = grid.best_estimator_
+        y_pred_test = pipe.predict(X_test)
+        results.append({
+            'Model': name,
+            'Test_R2': r2_score(y_test, y_pred_test),
+            'Test_RMSE': float(np.sqrt(mean_squared_error(y_test, y_pred_test))),
+            'Test_MAE': float(np.mean(np.abs(y_test - y_pred_test))),
+            'Test_MaxError': float(np.max(np.abs(y_test - y_pred_test))),
+            'y_test': y_test, 'y_pred_test': y_pred_test,
+            'Pipeline': pipe,
+        })
+        log.info("%-20s Test R2: %.4f (%.1fs)", name, results[-1]['Test_R2'], time.time() - t)
+
+    results.sort(key=lambda x: x['Test_R2'], reverse=True)
+    results_df = pd.DataFrame([{k: v for k, v in r.items()
+                                if k not in ('Pipeline', 'y_test', 'y_pred_test')}
+                               for r in results])
+    results_df.to_csv(os.path.join(SAVE_FOLDER, "model_results.csv"),
+                      index=False, encoding='utf-8-sig')
+
+    # ---------- 出图 ----------
+    log.info("\nPlotting...")
+    fig_parity(results)
+    fig_residual(results[0])
+    fig_r2_comparison(results)
+    fig_importance(X_train, X_test, y_train, y_test)
+
+    # ---------- 保存最优 Pipeline ----------
+    jl.dump(results[0]['Pipeline'], os.path.join(SAVE_FOLDER, "best_pipeline.pkl"))
+    log.info("Saved best pipeline: %s", os.path.join(SAVE_FOLDER, "best_pipeline.pkl"))
+    log.info("Total time: %.1f min", (time.time() - t0) / 60)
+    log.info("All outputs saved to: %s", SAVE_FOLDER)
+
+
+if __name__ == "__main__":
+    main()

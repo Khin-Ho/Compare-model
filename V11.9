@@ -1,0 +1,298 @@
+import os
+import json
+import time
+import logging
+import warnings
+import tempfile
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+# ====================== Windows 中文用户名 + joblib 修复 ======================
+tempfile.tempdir = r"C:\Temp"
+os.makedirs(tempfile.tempdir, exist_ok=True)
+os.environ["JOBLIB_TEMP_FOLDER"] = tempfile.tempdir
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import shap
+
+import joblib as jl
+import xgboost as xgb
+try:
+    import lightgbm as lgb
+    HAS_LGB = True
+except Exception:
+    HAS_LGB = False
+
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import (RandomForestRegressor, GradientBoostingRegressor,
+                              ExtraTreesRegressor, AdaBoostRegressor,
+                              HistGradientBoostingRegressor)
+from sklearn.neural_network import MLPRegressor
+from sklearn.metrics import (mean_squared_error, r2_score, mean_absolute_error,
+                             median_absolute_error, max_error)
+
+# ====================== CONFIG 区 ======================
+DATA_PATH = r"E:\桌面\soy\remove dataset for other.xlsx"
+MATERIAL_FILTER = None
+FEATURES = ["PS", "KOH", "R1o", "R2o", "R3o", "R4o", "R5o"]
+TARGET = "HIX"
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+CV_FOLDS = 5
+N_JOBS = -1
+SHAP_BACKGROUND_N = 100        # SHAP 背景样本数（计算速度 vs 精度）
+SAVE_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out", "V11.9")
+SHAP_DIR = os.path.join(SAVE_FOLDER, "shap")
+os.makedirs(SHAP_DIR, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(os.path.join(SAVE_FOLDER, "run.log"), encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("V11.9")
+
+
+def log_config():
+    cfg = {
+        "DATA_PATH": DATA_PATH, "MATERIAL_FILTER": MATERIAL_FILTER,
+        "FEATURES": FEATURES, "TARGET": TARGET, "TEST_SIZE": TEST_SIZE,
+        "RANDOM_STATE": RANDOM_STATE, "CV_FOLDS": CV_FOLDS,
+        "N_JOBS": N_JOBS, "SHAP_BACKGROUND_N": SHAP_BACKGROUND_N,
+    }
+    with open(os.path.join(SAVE_FOLDER, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    log.info("=" * 60)
+    for k, v in cfg.items():
+        log.info("  %s = %s", k, v)
+    log.info("=" * 60)
+
+
+def load_data():
+    if DATA_PATH.lower().endswith((".xlsx", ".xls")):
+        df = pd.read_excel(DATA_PATH)
+    else:
+        df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+    df = df.rename(columns={"PS(%)": "PS", "KOH(%)": "KOH"})
+    if MATERIAL_FILTER and "Material" in df.columns:
+        df = df[df["Material"].astype(str).str.strip() == MATERIAL_FILTER].copy()
+    for c in FEATURES + [TARGET]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    missing = [c for c in FEATURES + [TARGET] if c not in df.columns]
+    if missing:
+        raise KeyError(f"数据中缺少列: {missing}")
+    df = df.dropna(subset=FEATURES + [TARGET]).reset_index(drop=True)
+    return df
+
+
+def make_pipeline(model):
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        ("pca", PCA(n_components=0.95)),
+        ("model", model),
+    ])
+
+
+def all_metrics(y_true, y_pred):
+    eps = 1e-6
+    return {
+        "R2": r2_score(y_true, y_pred),
+        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "MAE": mean_absolute_error(y_true, y_pred),
+        "MAPE": float(np.mean(np.abs((y_true - y_pred) / np.maximum(np.abs(y_true), eps))) * 100),
+        "MedAE": median_absolute_error(y_true, y_pred),
+        "MaxError": max_error(y_true, y_pred),
+    }
+
+
+def build_models():
+    models = {
+        "Ridge": Ridge(),
+        "Lasso": Lasso(max_iter=10000),
+        "ElasticNet": ElasticNet(max_iter=10000),
+        "KNN": KNeighborsRegressor(),
+        "SVR": SVR(),
+        "DecisionTree": DecisionTreeRegressor(random_state=RANDOM_STATE),
+        "RandomForest": RandomForestRegressor(random_state=RANDOM_STATE),
+        "ExtraTrees": ExtraTreesRegressor(random_state=RANDOM_STATE),
+        "GradientBoosting": GradientBoostingRegressor(random_state=RANDOM_STATE),
+        "AdaBoost": AdaBoostRegressor(random_state=RANDOM_STATE),
+        "HistGradientBoosting": HistGradientBoostingRegressor(random_state=RANDOM_STATE),
+        "XGBoost": xgb.XGBRegressor(random_state=RANDOM_STATE, verbosity=0),
+        "MLP": MLPRegressor(random_state=RANDOM_STATE, max_iter=1000,
+                            early_stopping=True, n_iter_no_change=20),
+    }
+    if HAS_LGB:
+        models["LightGBM"] = lgb.LGBMRegressor(random_state=RANDOM_STATE, verbosity=-1)
+    return models
+
+
+PARAM_GRID = {
+    'Ridge': {'alpha': [0.1, 1, 5, 10, 20]},
+    'Lasso': {'alpha': [1e-4, 1e-3, 1e-2, 0.1]},
+    'ElasticNet': {'alpha': [1e-3, 1e-2, 0.1], 'l1_ratio': [0.3, 0.5, 0.7]},
+    'KNN': {'n_neighbors': [3, 5, 7, 10], 'weights': ['uniform', 'distance']},
+    'SVR': {'C': [0.1, 1, 10], 'epsilon': [0.05, 0.1, 0.2], 'kernel': ['rbf']},
+    'DecisionTree': {'max_depth': [3, 4, 5, 7], 'min_samples_leaf': [1, 2, 4]},
+    'RandomForest': {'n_estimators': [100, 200], 'max_depth': [5, 7, 10], 'min_samples_leaf': [1, 2]},
+    'ExtraTrees': {'n_estimators': [100, 200], 'max_depth': [5, 7, 10], 'min_samples_leaf': [1, 2]},
+    'GradientBoosting': {'n_estimators': [100, 200], 'learning_rate': [0.03, 0.05], 'max_depth': [3, 5]},
+    'AdaBoost': {'n_estimators': [50, 100], 'learning_rate': [0.05, 0.1, 0.3]},
+    'HistGradientBoosting': {'max_iter': [150, 300], 'learning_rate': [0.05, 0.1],
+                             'max_depth': [3, 5]},
+    'XGBoost': {'n_estimators': [100, 200], 'learning_rate': [0.03, 0.05], 'max_depth': [3, 5],
+                'subsample': [0.8, 1.0]},
+    'LightGBM': {'n_estimators': [100, 200], 'learning_rate': [0.03, 0.05],
+                 'num_leaves': [15, 31]},
+    'MLP': {'hidden_layer_sizes': [(32,), (64,), (32, 16)], 'alpha': [1e-3, 1e-2]},
+}
+
+TREE_NAMES = {"DecisionTree", "RandomForest", "ExtraTrees", "GradientBoosting",
+              "AdaBoost", "HistGradientBoosting", "XGBoost", "LightGBM"}
+
+
+def save_shap_fig(name, close=True):
+    path = os.path.join(SHAP_DIR, name)
+    plt.gcf().set_size_inches(8, 5.5)
+    plt.tight_layout()
+    plt.savefig(path, dpi=300, bbox_inches="tight", facecolor="white")
+    if close:
+        plt.close("all")
+    log.info("Saved SHAP figure: %s", path)
+
+
+def run_shap(model, X_train, X_test):
+    """对（无 PCA 的）树模型计算 SHAP 并输出图表与数据（V11.9 核心）。"""
+    log.info("Computing SHAP values ...")
+    rng = np.random.RandomState(RANDOM_STATE)
+    bg_idx = rng.choice(len(X_train), size=min(SHAP_BACKGROUND_N, len(X_train)),
+                        replace=False)
+    background = X_train.values[bg_idx]
+
+    explainer = shap.Explainer(model, background, feature_names=FEATURES)
+    shap_values = explainer(X_test.values)
+
+    # ---- 数据导出 ----
+    pd.DataFrame(shap_values.values, columns=FEATURES).to_csv(
+        os.path.join(SHAP_DIR, "shap_values.csv"), index=False, encoding='utf-8-sig')
+    imp = pd.DataFrame({
+        'Feature': FEATURES,
+        'Mean_abs_SHAP': np.abs(shap_values.values).mean(axis=0),
+    }).sort_values('Mean_abs_SHAP', ascending=False).reset_index(drop=True)
+    imp.to_csv(os.path.join(SHAP_DIR, "shap_importance.csv"),
+               index=False, encoding='utf-8-sig')
+    log.info("SHAP importance:\n" + imp.round(4).to_string(index=False))
+
+    # ---- 图 1: 全局重要性条形图 ----
+    shap.plots.bar(shap_values, max_display=12, show=False)
+    save_shap_fig("shap_bar.png")
+
+    # ---- 图 2: beeswarm（每样本每特征贡献分布）----
+    shap.plots.beeswarm(shap_values, max_display=10, show=False)
+    save_shap_fig("shap_beeswarm.png")
+
+    # ---- 图 3: 前 3 个重要特征的依赖图 ----
+    top3 = imp['Feature'].head(3).tolist()
+    for feat in top3:
+        shap.plots.scatter(shap_values[:, feat], show=False)
+        plt.gcf().set_size_inches(8, 5.5)
+        plt.tight_layout()
+        safe = feat.replace("/", "_")
+        plt.savefig(os.path.join(SHAP_DIR, f"shap_dependence_{safe}.png"),
+                    dpi=300, bbox_inches="tight", facecolor="white")
+        plt.close("all")
+        log.info("Saved SHAP dependence figure: shap_dependence_%s.png", safe)
+
+
+def main():
+    t0 = time.time()
+    log_config()
+
+    log.info("Loading data...")
+    df = load_data()
+    log.info("Data shape: %s", df.shape)
+    X = df[FEATURES]
+    y = df[TARGET].values
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+
+    # ---------- 14 模型调参（与 V11.4 相同）----------
+    results = []
+    for name, model in build_models().items():
+        t = time.time()
+        grid = GridSearchCV(make_pipeline(model),
+                            {"model__" + k: v for k, v in PARAM_GRID[name].items()},
+                            cv=CV_FOLDS, scoring='r2', n_jobs=N_JOBS, verbose=0)
+        grid.fit(X_train, y_train)
+        pipe = grid.best_estimator_
+        test_m = all_metrics(y_test, pipe.predict(X_test))
+        results.append({
+            'Model': name,
+            'Test_R2': test_m["R2"], 'Test_RMSE': test_m["RMSE"],
+            'Test_MAE': test_m["MAE"], 'Test_MAPE%': test_m["MAPE"],
+            'Best_Params_Dict': {k.replace("model__", ""): v
+                                 for k, v in grid.best_params_.items()},
+            'IsTree': name in TREE_NAMES,
+            'Pipeline': pipe,
+        })
+        log.info("%-20s Test R2: %.4f (%.1fs)", name, test_m["R2"], time.time() - t)
+
+    results.sort(key=lambda x: x['Test_R2'], reverse=True)
+    results_df = pd.DataFrame([{k: v for k, v in r.items()
+                                if k not in ('Pipeline', 'Best_Params_Dict')}
+                               for r in results])
+    results_df.to_csv(os.path.join(SAVE_FOLDER, "model_results.csv"),
+                      index=False, encoding='utf-8-sig')
+
+    # ---------- 选 SHAP 目标：优先最优树模型 ----------
+    best_tree = next((r for r in results if r['IsTree']), None)
+    if best_tree is None:
+        log.error("没有可解释的树模型，无法计算 SHAP")
+        return
+    if results[0]['Model'] != best_tree['Model']:
+        log.info("最优模型 %s 不是树模型，SHAP 改用表现最好的树模型 %s "
+                 "(Test R2=%.4f)", results[0]['Model'], best_tree['Model'],
+                 best_tree['Test_R2'])
+    else:
+        log.info("SHAP 目标: 最优模型 %s (Test R2=%.4f)",
+                 best_tree['Model'], best_tree['Test_R2'])
+
+    # ---------- 用调好的超参数在原始特征上重训（无 PCA，特征可解释）----------
+    params = best_tree['Best_Params_Dict']
+    name = best_tree['Model']
+    log.info("Retraining %s on raw features (no PCA) with %s ...", name, params)
+    tree_model = build_models()[name]
+    tree_model.set_params(**params)
+    tree_model.fit(X_train.values, y_train)
+    r2_raw = r2_score(y_test, tree_model.predict(X_test.values))
+    log.info("%s on raw features: Test R2 = %.4f", name, r2_raw)
+
+    # ---------- SHAP ----------
+    run_shap(tree_model, X_train, X_test)
+
+    # ---------- 保存最优 Pipeline 与 SHAP 模型 ----------
+    jl.dump(results[0]['Pipeline'], os.path.join(SAVE_FOLDER, "best_pipeline.pkl"))
+    jl.dump(tree_model, os.path.join(SHAP_DIR, "shap_tree_model.pkl"))
+    log.info("Total time: %.1f min", (time.time() - t0) / 60)
+    log.info("All outputs saved to: %s", SAVE_FOLDER)
+
+
+if __name__ == "__main__":
+    main()

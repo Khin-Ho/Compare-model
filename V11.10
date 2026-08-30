@@ -1,0 +1,647 @@
+import os
+import json
+import time
+import logging
+import warnings
+import tempfile
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+# ====================== Windows 中文用户名 + joblib 修复 ======================
+tempfile.tempdir = r"C:\Temp"
+os.makedirs(tempfile.tempdir, exist_ok=True)
+os.environ["JOBLIB_TEMP_FOLDER"] = tempfile.tempdir
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import joblib as jl
+import xgboost as xgb
+try:
+    import lightgbm as lgb
+    HAS_LGB = True
+except Exception:
+    HAS_LGB = False
+try:
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    HAS_OPTUNA = True
+except Exception:
+    HAS_OPTUNA = False
+try:
+    import shap
+    HAS_SHAP = True
+except Exception:
+    HAS_SHAP = False
+
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score, KFold
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+from sklearn.base import clone
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import (RandomForestRegressor, GradientBoostingRegressor,
+                              ExtraTreesRegressor, AdaBoostRegressor,
+                              HistGradientBoostingRegressor,
+                              StackingRegressor, VotingRegressor)
+from sklearn.neural_network import MLPRegressor
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import (mean_squared_error, r2_score, mean_absolute_error,
+                             median_absolute_error, max_error)
+
+# ====================== CONFIG 区 ======================
+DATA_PATH = r"E:\桌面\soy\remove dataset for other.xlsx"
+NEW_DATA_PATH = r"E:\桌面\soy\Tofu dataset.xlsx"   # 末尾演示预测用的新数据（不存在则跳过）
+MATERIAL_FILTER = None          # None / 'Soy' / 'Milk'
+FEATURES = ["PS", "KOH", "R1o", "R2o", "R3o", "R4o", "R5o"]
+TARGET = "HIX"
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+CV_FOLDS = 5
+N_JOBS = -1
+SAVE_TOP_N = 3
+
+# ---- 模块开关（按需关闭省时间）----
+DO_NESTED_CV = False           # V11.3: 无偏嵌套 CV（慢）
+USE_POLY = False               # V11.5: 多项式特征预处理
+DO_STACKING = True             # V11.6: 集成学习
+USE_OPTUNA = True              # V11.7: Optuna 调参（False 则用网格搜索）
+N_TRIALS = 15                  # Optuna 每模型试验次数
+DO_PLOTS = True                # V11.8: 图表
+DO_SHAP = True                 # V11.9: SHAP
+SHAP_BACKGROUND_N = 100
+
+SAVE_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out", "V11.10")
+FIGS_DIR = os.path.join(SAVE_FOLDER, "figs")
+SHAP_DIR = os.path.join(SAVE_FOLDER, "shap")
+for d in (FIGS_DIR, SHAP_DIR):
+    os.makedirs(d, exist_ok=True)
+
+# ---- 绘图配色（色盲安全；中性墨色文字）----
+INK, MUTED, GRID, SPINE, SURFACE = "#0b0b0b", "#898781", "#e1e0d9", "#c3c2b7", "#fcfcfb"
+BLUE, ORANGE = "#2a78d6", "#eb6834"
+plt.rcParams.update({
+    "figure.facecolor": SURFACE, "axes.facecolor": SURFACE,
+    "text.color": INK, "axes.labelcolor": INK,
+    "xtick.color": MUTED, "ytick.color": MUTED,
+    "axes.edgecolor": SPINE, "grid.color": GRID,
+    "font.size": 10, "axes.titlesize": 11,
+})
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(os.path.join(SAVE_FOLDER, "run.log"), encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("V11.10")
+
+
+def log_config():
+    cfg = {k: v for k, v in globals().items()
+           if k in ("DATA_PATH", "NEW_DATA_PATH", "MATERIAL_FILTER", "FEATURES", "TARGET",
+                    "TEST_SIZE", "RANDOM_STATE", "CV_FOLDS", "N_JOBS", "SAVE_TOP_N",
+                    "DO_NESTED_CV", "USE_POLY", "DO_STACKING", "USE_OPTUNA", "N_TRIALS",
+                    "DO_PLOTS", "DO_SHAP")}
+    with open(os.path.join(SAVE_FOLDER, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2, default=str)
+    log.info("=" * 60)
+    for k, v in cfg.items():
+        log.info("  %s = %s", k, v)
+    log.info("=" * 60)
+
+
+def load_data():
+    if DATA_PATH.lower().endswith((".xlsx", ".xls")):
+        df = pd.read_excel(DATA_PATH)
+    else:
+        df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+    df = df.rename(columns={"PS(%)": "PS", "KOH(%)": "KOH"})
+    if MATERIAL_FILTER and "Material" in df.columns:
+        df = df[df["Material"].astype(str).str.strip() == MATERIAL_FILTER].copy()
+    for c in FEATURES + [TARGET]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    missing = [c for c in FEATURES + [TARGET] if c not in df.columns]
+    if missing:
+        raise KeyError(f"数据中缺少列: {missing}")
+    df = df.dropna(subset=FEATURES + [TARGET]).reset_index(drop=True)
+    return df
+
+
+def all_metrics(y_true, y_pred):
+    eps = 1e-6
+    return {
+        "R2": r2_score(y_true, y_pred),
+        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "MAE": mean_absolute_error(y_true, y_pred),
+        "MAPE": float(np.mean(np.abs((y_true - y_pred) / np.maximum(np.abs(y_true), eps))) * 100),
+        "MedAE": median_absolute_error(y_true, y_pred),
+        "MaxError": max_error(y_true, y_pred),
+    }
+
+
+def make_preprocessor():
+    steps = []
+    if USE_POLY:
+        steps.append(("poly", PolynomialFeatures(degree=2, include_bias=False)))
+    steps += [("scaler", StandardScaler()), ("pca", PCA(n_components=0.95))]
+    return Pipeline(steps)
+
+
+def make_pipeline(model, pre):
+    return Pipeline([("pre", pre), ("model", model)])
+
+
+# ====================== 14 模型 + 网格 + Optuna 空间 ======================
+def build_models():
+    models = {
+        "Ridge": Ridge(),
+        "Lasso": Lasso(max_iter=10000),
+        "ElasticNet": ElasticNet(max_iter=10000),
+        "KNN": KNeighborsRegressor(),
+        "SVR": SVR(),
+        "DecisionTree": DecisionTreeRegressor(random_state=RANDOM_STATE),
+        "RandomForest": RandomForestRegressor(random_state=RANDOM_STATE),
+        "ExtraTrees": ExtraTreesRegressor(random_state=RANDOM_STATE),
+        "GradientBoosting": GradientBoostingRegressor(random_state=RANDOM_STATE),
+        "AdaBoost": AdaBoostRegressor(random_state=RANDOM_STATE),
+        "HistGradientBoosting": HistGradientBoostingRegressor(random_state=RANDOM_STATE),
+        "XGBoost": xgb.XGBRegressor(random_state=RANDOM_STATE, verbosity=0),
+        "MLP": MLPRegressor(random_state=RANDOM_STATE, max_iter=1000,
+                            early_stopping=True, n_iter_no_change=20),
+    }
+    if HAS_LGB:
+        models["LightGBM"] = lgb.LGBMRegressor(random_state=RANDOM_STATE, verbosity=-1)
+    return models
+
+
+PARAM_GRID = {
+    'Ridge': {'alpha': [0.1, 1, 5, 10, 20]},
+    'Lasso': {'alpha': [1e-4, 1e-3, 1e-2, 0.1]},
+    'ElasticNet': {'alpha': [1e-3, 1e-2, 0.1], 'l1_ratio': [0.3, 0.5, 0.7]},
+    'KNN': {'n_neighbors': [3, 5, 7, 10], 'weights': ['uniform', 'distance']},
+    'SVR': {'C': [0.1, 1, 10], 'epsilon': [0.05, 0.1, 0.2], 'kernel': ['rbf']},
+    'DecisionTree': {'max_depth': [3, 4, 5, 7], 'min_samples_leaf': [1, 2, 4]},
+    'RandomForest': {'n_estimators': [100, 200], 'max_depth': [5, 7, 10], 'min_samples_leaf': [1, 2]},
+    'ExtraTrees': {'n_estimators': [100, 200], 'max_depth': [5, 7, 10], 'min_samples_leaf': [1, 2]},
+    'GradientBoosting': {'n_estimators': [100, 200], 'learning_rate': [0.03, 0.05], 'max_depth': [3, 5]},
+    'AdaBoost': {'n_estimators': [50, 100], 'learning_rate': [0.05, 0.1, 0.3]},
+    'HistGradientBoosting': {'max_iter': [150, 300], 'learning_rate': [0.05, 0.1],
+                             'max_depth': [3, 5]},
+    'XGBoost': {'n_estimators': [100, 200], 'learning_rate': [0.03, 0.05], 'max_depth': [3, 5],
+                'subsample': [0.8, 1.0]},
+    'LightGBM': {'n_estimators': [100, 200], 'learning_rate': [0.03, 0.05],
+                 'num_leaves': [15, 31]},
+    'MLP': {'hidden_layer_sizes': [(32,), (64,), (32, 16)], 'alpha': [1e-3, 1e-2]},
+}
+
+TREE_NAMES = {"DecisionTree", "RandomForest", "ExtraTrees", "GradientBoosting",
+              "AdaBoost", "HistGradientBoosting", "XGBoost", "LightGBM"}
+
+
+def build_factory(name):
+    if name == "Ridge":
+        return (lambda **p: Ridge(**p),
+                lambda t: {"alpha": t.suggest_float("alpha", 0.01, 100, log=True)})
+    if name == "Lasso":
+        return (lambda **p: Lasso(max_iter=10000, **p),
+                lambda t: {"alpha": t.suggest_float("alpha", 1e-5, 1, log=True)})
+    if name == "ElasticNet":
+        return (lambda **p: ElasticNet(max_iter=10000, **p),
+                lambda t: {"alpha": t.suggest_float("alpha", 1e-5, 1, log=True),
+                           "l1_ratio": t.suggest_float("l1_ratio", 0.1, 0.9)})
+    if name == "KNN":
+        return (lambda **p: KNeighborsRegressor(**p),
+                lambda t: {"n_neighbors": t.suggest_int("n_neighbors", 2, 15),
+                           "weights": t.suggest_categorical("weights", ["uniform", "distance"]),
+                           "p": t.suggest_categorical("p", [1, 2])})
+    if name == "SVR":
+        return (lambda **p: SVR(**p),
+                lambda t: {"C": t.suggest_float("C", 0.1, 100, log=True),
+                           "epsilon": t.suggest_float("epsilon", 0.01, 0.5, log=True),
+                           "gamma": t.suggest_categorical("gamma", ["scale", "auto"])})
+    if name == "DecisionTree":
+        return (lambda **p: DecisionTreeRegressor(random_state=RANDOM_STATE, **p),
+                lambda t: {"max_depth": t.suggest_int("max_depth", 2, 12),
+                           "min_samples_split": t.suggest_int("min_samples_split", 2, 20),
+                           "min_samples_leaf": t.suggest_int("min_samples_leaf", 1, 10)})
+    if name in ("RandomForest", "ExtraTrees"):
+        cls = RandomForestRegressor if name == "RandomForest" else ExtraTreesRegressor
+        return (lambda **p: cls(random_state=RANDOM_STATE, **p),
+                lambda t: {"n_estimators": t.suggest_int("n_estimators", 50, 400),
+                           "max_depth": t.suggest_int("max_depth", 3, 20),
+                           "min_samples_leaf": t.suggest_int("min_samples_leaf", 1, 5),
+                           "max_features": t.suggest_categorical("max_features", [0.5, 0.8, 1.0])})
+    if name == "GradientBoosting":
+        return (lambda **p: GradientBoostingRegressor(random_state=RANDOM_STATE, **p),
+                lambda t: {"n_estimators": t.suggest_int("n_estimators", 50, 400),
+                           "learning_rate": t.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                           "max_depth": t.suggest_int("max_depth", 2, 8),
+                           "subsample": t.suggest_float("subsample", 0.6, 1.0)})
+    if name == "AdaBoost":
+        return (lambda **p: AdaBoostRegressor(random_state=RANDOM_STATE, **p),
+                lambda t: {"n_estimators": t.suggest_int("n_estimators", 20, 300),
+                           "learning_rate": t.suggest_float("learning_rate", 0.01, 1.0, log=True)})
+    if name == "HistGradientBoosting":
+        return (lambda **p: HistGradientBoostingRegressor(random_state=RANDOM_STATE, **p),
+                lambda t: {"max_iter": t.suggest_int("max_iter", 50, 400),
+                           "learning_rate": t.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                           "max_depth": t.suggest_int("max_depth", 2, 10),
+                           "min_samples_leaf": t.suggest_int("min_samples_leaf", 5, 50),
+                           "l2_regularization": t.suggest_float("l2_regularization", 1e-3, 10, log=True)})
+    if name == "XGBoost":
+        return (lambda **p: xgb.XGBRegressor(random_state=RANDOM_STATE, verbosity=0, **p),
+                lambda t: {"n_estimators": t.suggest_int("n_estimators", 50, 500),
+                           "learning_rate": t.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                           "max_depth": t.suggest_int("max_depth", 2, 10),
+                           "subsample": t.suggest_float("subsample", 0.6, 1.0),
+                           "colsample_bytree": t.suggest_float("colsample_bytree", 0.5, 1.0),
+                           "reg_alpha": t.suggest_float("reg_alpha", 1e-4, 10, log=True),
+                           "reg_lambda": t.suggest_float("reg_lambda", 1e-3, 100, log=True)})
+    if name == "LightGBM":
+        return (lambda **p: lgb.LGBMRegressor(random_state=RANDOM_STATE, verbosity=-1, **p),
+                lambda t: {"n_estimators": t.suggest_int("n_estimators", 50, 500),
+                           "learning_rate": t.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                           "num_leaves": t.suggest_int("num_leaves", 7, 127),
+                           "subsample": t.suggest_float("subsample", 0.6, 1.0),
+                           "colsample_bytree": t.suggest_float("colsample_bytree", 0.5, 1.0),
+                           "reg_alpha": t.suggest_float("reg_alpha", 1e-4, 10, log=True),
+                           "reg_lambda": t.suggest_float("reg_lambda", 1e-3, 100, log=True)})
+    if name == "MLP":
+        return (lambda **p: MLPRegressor(random_state=RANDOM_STATE, max_iter=1000,
+                                         early_stopping=True, n_iter_no_change=20, **p),
+                lambda t: {"hidden_layer_sizes": t.suggest_categorical(
+                               "hidden_layer_sizes", [(32,), (64,), (128,), (32, 16), (64, 32)]),
+                           "alpha": t.suggest_float("alpha", 1e-5, 1, log=True),
+                           "learning_rate_init": t.suggest_float("learning_rate_init", 1e-4, 1e-2, log=True)})
+    raise KeyError(name)
+
+
+def cv_r2(model, X, y):
+    cv = KFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    return float(cross_val_score(model, X, y, cv=cv, scoring='r2', n_jobs=N_JOBS).mean())
+
+
+def optuna_search(name, X, y):
+    build_fn, space = build_factory(name)
+
+    def objective(trial):
+        return cv_r2(build_fn(**space(trial)), X, y)
+
+    study = optuna.create_study(direction="maximize",
+                                sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE))
+    study.optimize(objective, n_trials=N_TRIALS)
+    return study.best_value, study.best_params
+
+
+# ====================== 图表（V11.8）======================
+def style_axes(ax):
+    ax.grid(True, color=GRID, lw=0.8)
+    ax.set_axisbelow(True)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+
+
+def save_fig(fig, name):
+    path = os.path.join(FIGS_DIR, name)
+    fig.tight_layout()
+    fig.savefig(path, dpi=300, facecolor=SURFACE)
+    plt.close(fig)
+    log.info("Saved figure: %s", path)
+
+
+def plot_figures(results):
+    n = min(4, len(results))
+    fig, axes = plt.subplots(2, 2, figsize=(9.5, 8))
+    for ax, r in zip(axes.ravel(), results[:n]):
+        style_axes(ax)
+        ax.scatter(r['y_test'], r['y_pred_test'], s=16, color=BLUE, alpha=0.6,
+                   linewidths=0, zorder=2)
+        vmin = min(r['y_test'].min(), r['y_pred_test'].min())
+        vmax = max(r['y_test'].max(), r['y_pred_test'].max())
+        pad = (vmax - vmin) * 0.06
+        ax.plot([vmin - pad, vmax + pad], [vmin - pad, vmax + pad], "--",
+                color=INK, lw=1.4, zorder=3)
+        ax.set_xlim(vmin - pad, vmax + pad)
+        ax.set_ylim(vmin - pad, vmax + pad)
+        ax.set_xlabel("Measured HIX")
+        ax.set_ylabel("Predicted HIX")
+        ax.set_title(r['Model'], fontsize=11)
+        ax.text(0.03, 0.97, f"R2 = {r['Test_R2']:.3f}\nRMSE = {r['Test_RMSE']:.3f}",
+                transform=ax.transAxes, va="top", ha="left", fontsize=9, color=INK,
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=GRID, alpha=0.9))
+    save_fig(fig, "parity_top4.png")
+
+    best = results[0]
+    fig, ax = plt.subplots(figsize=(6.5, 4.6))
+    style_axes(ax)
+    resid = best['y_test'] - best['y_pred_test']
+    ax.axhline(0, color=INK, lw=1.2, ls="--", zorder=3)
+    ax.scatter(best['y_pred_test'], resid, s=16, color=ORANGE, alpha=0.6,
+               linewidths=0, zorder=2)
+    ax.set_xlabel("Predicted HIX")
+    ax.set_ylabel("Residual (Measured - Predicted)")
+    ax.set_title(f"Residuals - {best['Model']}", fontsize=11)
+    save_fig(fig, "residual_best.png")
+
+    rows = sorted(results, key=lambda x: x['Test_R2'])
+    fig, ax = plt.subplots(figsize=(7.5, 6.5))
+    style_axes(ax)
+    y_pos = np.arange(len(rows))
+    ax.barh(y_pos, [r['Test_R2'] for r in rows], height=0.6, color=BLUE)
+    for yi, r in zip(y_pos, rows):
+        ax.text(r['Test_R2'] + 0.004, yi, f"{r['Test_R2']:.3f}",
+                va="center", ha="left", fontsize=8.5, color=INK)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels([r['Model'] for r in rows], fontsize=9)
+    ax.set_xlabel("Test R2")
+    ax.set_title("Model comparison (Test R2)", fontsize=11)
+    save_fig(fig, "r2_comparison.png")
+
+    rf = Pipeline([("scaler", StandardScaler()),
+                   ("model", RandomForestRegressor(n_estimators=200,
+                                                   random_state=RANDOM_STATE))])
+    rf.fit(X_train, y_train)
+    imp = permutation_importance(rf, X_test, y_test, n_repeats=20,
+                                 random_state=RANDOM_STATE, n_jobs=N_JOBS)
+    order = np.argsort(imp.importances_mean)
+    fig, ax = plt.subplots(figsize=(7.5, 5.2))
+    style_axes(ax)
+    ax.barh(np.arange(len(FEATURES)), imp.importances_mean[order],
+            xerr=imp.importances_std[order], height=0.6, color=BLUE, capsize=3,
+            error_kw=dict(ecolor=INK, lw=0.9))
+    ax.set_yticks(np.arange(len(FEATURES)))
+    ax.set_yticklabels([FEATURES[i] for i in order], fontsize=9)
+    ax.set_xlabel("Permutation importance (R2 decrease)")
+    ax.set_title("Feature importance (RandomForest)", fontsize=11)
+    save_fig(fig, "importance.png")
+
+
+# ====================== SHAP（V11.9）======================
+def run_shap(tree_model, X_train_raw, X_test_raw):
+    rng = np.random.RandomState(RANDOM_STATE)
+    bg_idx = rng.choice(len(X_train_raw), size=min(SHAP_BACKGROUND_N, len(X_train_raw)),
+                        replace=False)
+    explainer = shap.Explainer(tree_model, X_train_raw.values[bg_idx],
+                               feature_names=FEATURES)
+    shap_values = explainer(X_test_raw.values)
+
+    pd.DataFrame(shap_values.values, columns=FEATURES).to_csv(
+        os.path.join(SHAP_DIR, "shap_values.csv"), index=False, encoding='utf-8-sig')
+    imp = pd.DataFrame({
+        'Feature': FEATURES,
+        'Mean_abs_SHAP': np.abs(shap_values.values).mean(axis=0),
+    }).sort_values('Mean_abs_SHAP', ascending=False).reset_index(drop=True)
+    imp.to_csv(os.path.join(SHAP_DIR, "shap_importance.csv"),
+               index=False, encoding='utf-8-sig')
+
+    shap.plots.bar(shap_values, max_display=12, show=False)
+    plt.tight_layout()
+    plt.savefig(os.path.join(SHAP_DIR, "shap_bar.png"), dpi=300,
+                bbox_inches="tight", facecolor="white")
+    plt.close("all")
+
+    shap.plots.beeswarm(shap_values, max_display=10, show=False)
+    plt.tight_layout()
+    plt.savefig(os.path.join(SHAP_DIR, "shap_beeswarm.png"), dpi=300,
+                bbox_inches="tight", facecolor="white")
+    plt.close("all")
+
+    for feat in imp['Feature'].head(3):
+        shap.plots.scatter(shap_values[:, feat], show=False)
+        plt.tight_layout()
+        plt.savefig(os.path.join(SHAP_DIR, f"shap_dependence_{feat}.png"), dpi=300,
+                    bbox_inches="tight", facecolor="white")
+        plt.close("all")
+    log.info("SHAP importance:\n" + imp.round(4).to_string(index=False))
+    return imp
+
+
+# ====================== 新数据预测（V11.2 的实战化）======================
+def predict_new_data(pipeline_path, new_data_df, save_csv=None):
+    pipe = jl.load(pipeline_path)
+    X_new = new_data_df[FEATURES].astype(float)
+    out = new_data_df.copy()
+    out["HIX_pred"] = pipe.predict(X_new)
+    if save_csv is not None:
+        out.to_csv(save_csv, index=False, encoding='utf-8-sig')
+        log.info("Predictions saved to: %s", save_csv)
+    return out
+
+
+def df_to_md_table(df_):
+    """DataFrame 转 markdown 表格；未装 tabulate 时用简单降级方案。"""
+    try:
+        return df_.to_markdown(index=False)
+    except Exception:
+        header = "| " + " | ".join(str(c) for c in df_.columns) + " |"
+        sep = "|" + "|".join(["---"] * len(df_.columns)) + "|"
+        body = ["| " + " | ".join(str(v) for v in row) + " |" for row in df_.values]
+        return "\n".join([header, sep] + body)
+
+
+def generate_report(results_df, ensemble_df, shap_imp):
+    lines = ["# V11.10 模型对比报告", "",
+             f"- 数据: {DATA_PATH} (n={len(df)}, 特征={FEATURES}, 目标={TARGET})",
+             f"- 随机种子: {RANDOM_STATE}, 测试集比例: {TEST_SIZE}",
+             f"- 多项式特征: {USE_POLY}, Optuna 调参: {USE_OPTUNA}, 集成: {DO_STACKING}",
+             "", "## 全部模型结果（按 Test R2 排序）", "",
+             df_to_md_table(results_df), ""]
+    if ensemble_df is not None and len(ensemble_df):
+        lines += ["## 集成 vs 最优单模型", "", df_to_md_table(ensemble_df), ""]
+    if shap_imp is not None:
+        lines += ["## SHAP 特征重要性（最优树模型）", "",
+                  df_to_md_table(shap_imp.round(4)), ""]
+    lines += ["## 图表", "",
+              "- figs/parity_top4.png  预测 vs 实测（top4）",
+              "- figs/residual_best.png  残差图",
+              "- figs/r2_comparison.png  模型对比",
+              "- figs/importance.png  特征重要性",
+              "- shap/shap_bar.png / shap_beeswarm.png  SHAP 图",
+              "", "## 产出文件", "",
+              "- final_best_pipeline.pkl  最终模型（可直接 predict 新数据）",
+              "- ensemble_stacking.pkl / ensemble_voting.pkl  集成模型",
+              "- model_results.csv / ensemble_vs_single.csv  结果表"]
+    with open(os.path.join(SAVE_FOLDER, "report.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    log.info("Saved report: %s", os.path.join(SAVE_FOLDER, "report.md"))
+
+
+def main():
+    global df, X_train, X_test  # report 使用
+    t0 = time.time()
+    log_config()
+
+    # ---------- 数据 ----------
+    log.info("Loading data...")
+    df = load_data()
+    log.info("Data shape: %s", df.shape)
+    X = df[FEATURES]
+    y = df[TARGET].values
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+    log.info("Training set: %s, Test set: %s", X_train.shape, X_test.shape)
+
+    # ---------- 预处理（PCA 特征，网格/Optuna 共用）----------
+    pre = make_preprocessor()
+    X_train_pca = pre.fit_transform(X_train)
+    X_test_pca = pre.transform(X_test)
+    log.info("After preprocessing: %d features", X_train_pca.shape[1])
+
+    # ---------- 14 模型：Optuna 或 网格 ----------
+    results_path = os.path.join(SAVE_FOLDER, "model_results.csv")
+    if os.path.exists(results_path):
+        os.remove(results_path)
+
+    results = []
+    for name, model in build_models().items():
+        t = time.time()
+        log.info("\nTraining %s ...", name)
+
+        if USE_OPTUNA and HAS_OPTUNA:
+            cv_best, best_params = optuna_search(name, X_train_pca, y_train)
+            best_model = build_factory(name)[0](**best_params)
+        else:
+            grid = GridSearchCV(model, PARAM_GRID[name],
+                                cv=KFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE),
+                                scoring='r2', n_jobs=N_JOBS, verbose=0)
+            grid.fit(X_train_pca, y_train)
+            cv_best = float(grid.best_score_)
+            best_params = grid.best_params_
+            best_model = grid.best_estimator_
+
+        best_model.fit(X_train_pca, y_train)
+        pipe = make_pipeline(best_model, pre)
+        y_pred_test = pipe.predict(X_test)
+        test_m = all_metrics(y_test, y_pred_test)
+
+        if DO_NESTED_CV:
+            outer = KFold(5, shuffle=True, random_state=RANDOM_STATE)
+            inner = KFold(5, shuffle=True, random_state=RANDOM_STATE)
+            gs = GridSearchCV(make_pipeline(build_models()[name], make_preprocessor()),
+                              {"model__" + k: v for k, v in PARAM_GRID[name].items()},
+                              cv=inner, scoring='r2', n_jobs=N_JOBS)
+            nested = cross_val_score(gs, X_train, y_train, cv=outer, scoring='r2', n_jobs=1)
+            nested_mean, nested_std = nested.mean(), nested.std()
+        else:
+            nested_mean = nested_std = np.nan
+
+        results.append({
+            'Model': name, 'CV_R2': cv_best,
+            'Train_R2': all_metrics(y_train, pipe.predict(X_train))["R2"],
+            'Test_R2': test_m["R2"], 'Test_RMSE': test_m["RMSE"],
+            'Test_MAE': test_m["MAE"], 'Test_MAPE%': test_m["MAPE"],
+            'NestedCV_R2_mean': nested_mean, 'NestedCV_R2_std': nested_std,
+            'Best_Params': str(best_params),
+            'Time_sec': round(time.time() - t, 1),
+            'IsTree': name in TREE_NAMES,
+            'Pipeline': pipe, 'y_test': y_test, 'y_pred_test': y_pred_test,
+            'Best_Params_Dict': best_params,
+        })
+        log.info("CV R2: %.4f | Test R2: %.4f | RMSE: %.4f (%.1fs)",
+                 cv_best, test_m["R2"], test_m["RMSE"], time.time() - t)
+
+        row_df = pd.DataFrame([{k: v for k, v in results[-1].items()
+                                if k not in ('Pipeline', 'y_test', 'y_pred_test',
+                                             'Best_Params_Dict')}])
+        row_df.to_csv(results_path, mode='a',
+                      header=not os.path.exists(results_path), index=False, encoding='utf-8-sig')
+
+    results.sort(key=lambda x: x['Test_R2'], reverse=True)
+
+    # ---------- 集成（V11.6）----------
+    ensemble_df = None
+    if DO_STACKING and len(results) >= 3:
+        base_names = [r['Model'] for r in results[:5]]
+        base_pipes = [r['Pipeline'] for r in results[:5]]
+        log.info("\nEnsemble base learners: %s", base_names)
+        stack = StackingRegressor(
+            estimators=[(n, clone(p)) for n, p in zip(base_names, base_pipes)],
+            final_estimator=Ridge(alpha=1.0), cv=5, passthrough=True, n_jobs=N_JOBS)
+        stack.fit(X_train, y_train)
+        voting = VotingRegressor(
+            estimators=[(n, clone(p)) for n, p in zip(base_names, base_pipes)],
+            n_jobs=N_JOBS)
+        voting.fit(X_train, y_train)
+
+        top3 = results[:3]
+        def top3_avg(X_df):
+            return np.column_stack([r['Pipeline'].predict(X_df) for r in top3]).mean(axis=1)
+
+        rows = []
+        for tag, obj in [("Stacking (top5+Ridge)", stack), ("Voting avg (top5)", voting)]:
+            te = all_metrics(y_test, obj.predict(X_test))
+            rows.append({'Ensemble': tag, 'Test_R2': te["R2"], 'Test_RMSE': te["RMSE"],
+                         'Test_MAE': te["MAE"], 'Test_MAPE%': te["MAPE"],
+                         'Members': '+'.join(base_names)})
+        te = all_metrics(y_test, top3_avg(X_test))
+        rows.append({'Ensemble': 'Avg (top3)', 'Test_R2': te["R2"], 'Test_RMSE': te["RMSE"],
+                     'Test_MAE': te["MAE"], 'Test_MAPE%': te["MAPE"],
+                     'Members': '+'.join(r['Model'] for r in top3)})
+        rows.insert(0, {'Ensemble': f"Best single ({results[0]['Model']})",
+                        'Test_R2': results[0]['Test_R2'], 'Test_RMSE': results[0]['Test_RMSE'],
+                        'Test_MAE': results[0]['Test_MAE'], 'Test_MAPE%': results[0]['Test_MAPE%'],
+                        'Members': '-'})
+        ensemble_df = pd.DataFrame(rows)
+        ensemble_df.to_csv(os.path.join(SAVE_FOLDER, "ensemble_vs_single.csv"),
+                           index=False, encoding='utf-8-sig')
+        jl.dump(stack, os.path.join(SAVE_FOLDER, "ensemble_stacking.pkl"))
+        jl.dump(voting, os.path.join(SAVE_FOLDER, "ensemble_voting.pkl"))
+        log.info("\n" + ensemble_df.to_string(index=False))
+
+    # ---------- 图表（V11.8）----------
+    if DO_PLOTS:
+        log.info("\nPlotting...")
+        plot_figures(results)
+
+    # ---------- SHAP（V11.9）----------
+    shap_imp = None
+    if DO_SHAP and HAS_SHAP:
+        best_tree = next((r for r in results if r['IsTree']), None)
+        if best_tree is not None:
+            if results[0]['Model'] != best_tree['Model']:
+                log.info("最优模型 %s 不是树模型，SHAP 用最好的树模型 %s",
+                         results[0]['Model'], best_tree['Model'])
+            log.info("SHAP: retraining %s on raw features (no PCA) ...", best_tree['Model'])
+            tree_model = build_models()[best_tree['Model']]
+            tree_model.set_params(**best_tree['Best_Params_Dict'])
+            tree_model.fit(X_train.values, y_train)
+            shap_imp = run_shap(tree_model, X_train, X_test)
+
+    # ---------- 最终模型保存 + 报告 ----------
+    best_pipe = results[0]['Pipeline']
+    jl.dump(best_pipe, os.path.join(SAVE_FOLDER, "final_best_pipeline.pkl"))
+    log.info("\nFinal best model: %s, Test R2 = %.4f, RMSE = %.4f",
+             results[0]['Model'], results[0]['Test_R2'], results[0]['Test_RMSE'])
+
+    results_df = pd.DataFrame([{k: v for k, v in r.items()
+                                if k not in ('Pipeline', 'y_test', 'y_pred_test',
+                                             'Best_Params_Dict', 'IsTree')}
+                               for r in results])
+    generate_report(results_df, ensemble_df, shap_imp)
+
+    # ---------- 新数据预测演示 ----------
+    if os.path.exists(NEW_DATA_PATH):
+        log.info("\n===== 新数据预测演示 =====")
+        new_df = pd.read_excel(NEW_DATA_PATH).rename(columns={"PS(%)": "PS", "KOH(%)": "KOH"})
+        pred_df = predict_new_data(os.path.join(SAVE_FOLDER, "final_best_pipeline.pkl"),
+                                   new_df, save_csv=os.path.join(SAVE_FOLDER, "new_data_predictions.csv"))
+        log.info("\n" + pred_df[["Material", "PS", "KOH", "HIX", "HIX_pred"]].head(8).to_string(index=False))
+    else:
+        log.info("未找到新数据文件 %s，跳过预测演示", NEW_DATA_PATH)
+
+    log.info("Total time: %.1f min", (time.time() - t0) / 60)
+    log.info("All outputs saved to: %s", SAVE_FOLDER)
+
+
+if __name__ == "__main__":
+    main()

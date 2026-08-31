@@ -1,0 +1,129 @@
+import os
+import tempfile
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.decomposition import PCA
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+import joblib as jl
+import xgboost as xgb
+
+# ====================== 临时目录（防 joblib 报错） ======================
+tempfile.tempdir = r"C:\Temp"
+os.makedirs(tempfile.tempdir, exist_ok=True)
+
+# ====================== 路径配置 ======================
+DATA_PATH = r"E:\桌面\Milk\数据库-平均强度.xlsx"
+SAVE_FOLDER = r"E:\桌面\Milk\model_A"
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# ====================== 读取 Excel ======================
+print("Loading Excel data...")
+df = pd.read_excel(DATA_PATH)
+
+# ====================== 列名统一 ======================
+df = df.rename(columns={
+    'PS(%)': 'PS',
+    'KOH(%)': 'KOH'
+})
+
+# ====================== 目标变量：HIX 归一化 ======================
+hix_scaler = MinMaxScaler()
+df['HIX_normalized'] = hix_scaler.fit_transform(df[['HIX']])
+
+# ====================== 特征 & 标签 ======================
+features = ['PS', 'KOH', 'R1', 'R2', 'R3', 'R4', 'R5']
+X = df[features].values
+y = df['HIX_normalized'].values
+
+print("Checking missing values:")
+print(df[features + ['HIX']].isnull().sum())
+
+# ====================== 标准化 + PCA ======================
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+pca = PCA(n_components=0.95)
+X_pca = pca.fit_transform(X_scaled)
+print(f"Features: {X.shape[1]} → PCA: {X_pca.shape[1]}")
+
+# ====================== 数据集划分 ======================
+X_train, X_test, y_train, y_test = train_test_split(
+    X_pca, y, test_size=0.2, random_state=42
+)
+
+# ====================== 模型池 ======================
+models = {
+    "Ridge": Ridge(),
+    "KNN": KNeighborsRegressor(),
+    "SVR": SVR(),
+    "DecisionTree": DecisionTreeRegressor(random_state=42),
+    "RandomForest": RandomForestRegressor(random_state=42),
+    "GradientBoosting": GradientBoostingRegressor(random_state=42),
+    "XGBoost": xgb.XGBRegressor(random_state=42, n_jobs=1)
+}
+
+# ====================== 超参数 ======================
+param_grid = {
+    'Ridge': {'alpha': [1, 5, 10, 20]},
+    'KNN': {'n_neighbors': [3,5,7,10], 'weights': ['uniform','distance'], 'p':[1,2]},
+    'SVR': {'C':[0.1,1,10], 'epsilon':[0.01,0.1], 'kernel':['rbf']},
+    'DecisionTree': {'max_depth':[2,3,4,5]},
+    'RandomForest': {'n_estimators':[100,200], 'max_depth':[3,5,7]},
+    'GradientBoosting': {'n_estimators':[100,200], 'learning_rate':[0.03,0.05]},
+    'XGBoost': {
+        'n_estimators':[100,200],
+        'learning_rate':[0.03,0.05],
+        'max_depth':[3,4],
+        'subsample':[0.8,1.0],
+        'colsample_bytree':[0.8,1.0]
+    }
+}
+
+# ====================== 训练 & 评估 ======================
+results = []
+
+for name, model in models.items():
+    print(f"\nTraining {name} ...")
+    grid = GridSearchCV(
+        model,
+        param_grid[name],
+        cv=5,
+        scoring='r2',
+        n_jobs=1,
+        verbose=0
+    )
+    grid.fit(X_train, y_train)
+
+    best_model = grid.best_estimator_
+
+    y_train_pred = best_model.predict(X_train)
+    y_test_pred = best_model.predict(X_test)
+
+    train_r2 = r2_score(y_train, y_train_pred)
+    test_r2 = r2_score(y_test, y_test_pred)
+    cv_r2 = cross_val_score(best_model, X_train, y_train, cv=5, scoring='r2').mean()
+
+    print(f"R2 → Train: {train_r2:.3f}, Test: {test_r2:.3f}, CV: {cv_r2:.3f}")
+
+    jl.dump(best_model, os.path.join(SAVE_FOLDER, f"{name}.pkl"))
+
+    results.append({
+        'Model': name,
+        'Train_R2': train_r2,
+        'Test_R2': test_r2,
+        'CV_R2': cv_r2
+    })
+
+# ====================== 结果保存 ======================
+results_df = pd.DataFrame(results).sort_values('Test_R2', ascending=False)
+results_df.to_csv(os.path.join(SAVE_FOLDER, "model_performance_A.csv"), index=False)
+
+print("\n===== Final Results =====")
+print(results_df)

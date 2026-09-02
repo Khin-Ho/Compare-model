@@ -1,0 +1,93 @@
+import os
+import tempfile
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.metrics import r2_score
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+import xgboost as xgb
+import joblib as jl
+
+# ====================== 临时文件夹修正 ======================
+tempfile.tempdir = r"C:\Temp"
+os.makedirs(tempfile.tempdir, exist_ok=True)
+
+# ====================== 路径 ======================
+DATA_PATH = r"E:\桌面\Milk\数据库-平均强度.xlsx"
+SAVE_FOLDER = r"E:\桌面\Milk\model_A"
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# ====================== 读取数据 ======================
+df = pd.read_excel(DATA_PATH)
+df = df.rename(columns={'PS(%)': 'PS', 'KOH(%)': 'KOH'})
+
+# ====================== HIX 归一化 ======================
+scaler_y = MinMaxScaler()
+df['HIX_normalized'] = scaler_y.fit_transform(df[['HIX']])
+
+# ====================== 特征 ======================
+features = ['PS', 'KOH', 'R1', 'R2', 'R3', 'R4', 'R5']
+X = df[features].values
+y = df['HIX_normalized'].values
+
+# ====================== 划分数据 ======================
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# ====================== 模型字典 ======================
+models = {
+    "Ridge": Ridge(),
+    "KNN": KNeighborsRegressor(),
+    "SVR": SVR(),
+    "DecisionTree": DecisionTreeRegressor(random_state=42),
+    "RandomForest": RandomForestRegressor(random_state=42),
+    "GradientBoosting": GradientBoostingRegressor(random_state=42),
+    "XGBoost": xgb.XGBRegressor(random_state=42, n_jobs=1)
+}
+
+# ====================== 超参数 ======================
+param_grid = {
+    'Ridge': {'alpha': [0.1, 1, 5, 10, 20]},
+    'KNN': {'n_neighbors': [3, 5, 7, 9], 'weights': ['uniform', 'distance'], 'p': [1, 2]},
+    'SVR': {'C': [0.1, 1, 5, 10], 'epsilon': [0.01, 0.05, 0.1], 'kernel': ['rbf', 'linear']},
+    'DecisionTree': {'max_depth': [3, 4, 5, 6], 'min_samples_split': [2, 5, 10], 'min_samples_leaf': [1, 2, 3]},
+    'RandomForest': {'n_estimators': [100, 150, 200], 'max_depth': [4, 6, 8], 'min_samples_split': [2, 5, 10],
+                     'min_samples_leaf': [1, 2]},
+    'GradientBoosting': {'n_estimators': [100, 150, 200], 'learning_rate': [0.01, 0.03, 0.05], 'max_depth': [3, 4, 5]},
+    'XGBoost': {'n_estimators': [100, 150, 200], 'learning_rate': [0.01, 0.03, 0.05],
+                'max_depth': [3, 4, 5], 'subsample': [0.7, 0.8, 1.0], 'colsample_bytree': [0.7, 0.8, 1.0],
+                'reg_alpha': [0, 0.1, 0.5, 1], 'reg_lambda': [1, 5, 10]}
+}
+
+# ====================== 训练与评估 ======================
+results = []
+
+for name, model in models.items():
+    print(f"\nTraining {name} ...")
+    grid = GridSearchCV(model, param_grid[name], cv=5, scoring='r2', n_jobs=1, verbose=1)  # n_jobs=1 避免中文路径报错
+    grid.fit(X_train, y_train)
+
+    best_model = grid.best_estimator_
+
+    train_r2 = r2_score(y_train, best_model.predict(X_train))
+    test_r2 = r2_score(y_test, best_model.predict(X_test))
+    cv_r2 = cross_val_score(best_model, X_train, y_train, cv=5, scoring='r2', n_jobs=1).mean()
+
+    print(f"{name} | Train R2: {train_r2:.3f}, Test R2: {test_r2:.3f}, CV R2: {cv_r2:.3f}")
+
+    # 保存模型
+    jl.dump(best_model, os.path.join(SAVE_FOLDER, f"{name}.pkl"))
+
+    results.append({'Model': name, 'Train_R2': train_r2, 'Test_R2': test_r2, 'CV_R2': cv_r2})
+
+# ====================== 保存结果 ======================
+results_df = pd.DataFrame(results)
+results_df.to_csv(os.path.join(SAVE_FOLDER, 'tree_models_noPCA_results.csv'), index=False)
+
+print("\n===== Final Results ======")
+print(results_df)
+print(f"Results saved to: {SAVE_FOLDER}")

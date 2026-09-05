@@ -1,0 +1,58 @@
+import os
+import tempfile
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score
+from sklearn.ensemble import RandomForestRegressor
+import joblib
+
+# ====================== 临时目录 ======================
+tempfile.tempdir = r"C:\Temp"
+os.makedirs(tempfile.tempdir, exist_ok=True)
+
+# ====================== 路径 ======================
+DATA_PATH = r"E:\桌面\Milk\数据库-积分重构.xlsx"
+SAVE_FOLDER = r"E:\桌面\Milk\model1"
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# ====================== 读取数据 ======================
+df = pd.read_excel(DATA_PATH)
+
+# ====================== 特征 & 标签 ======================
+X = df[['PS','KOH','R1o','R2o','R3o','R4o','R5o']]
+y = df['HIX']
+
+# ====================== 划分数据 ======================
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+# ====================== 标准化（只对 X） ======================
+scaler_X = StandardScaler()
+X_train_scaled = scaler_X.fit_transform(X_train)
+X_test_scaled = scaler_X.transform(X_test)
+
+# ====================== 模型 ======================
+model = RandomForestRegressor(
+    n_estimators=300,
+    max_depth=6,
+    random_state=42
+)
+
+# ====================== 训练 ======================
+model.fit(X_train_scaled, y_train)
+
+# ====================== 评估 ======================
+train_r2 = r2_score(y_train, model.predict(X_train_scaled))
+test_r2 = r2_score(y_test, model.predict(X_test_scaled))
+
+print(f"Train R2: {train_r2:.3f}")
+print(f"Test  R2: {test_r2:.3f}")
+
+# ====================== 保存 ======================
+joblib.dump(model, os.path.join(SAVE_FOLDER, "HIX_forward_model.pkl"))
+joblib.dump(scaler_X, os.path.join(SAVE_FOLDER, "scaler_X.pkl"))
+
+print("✅ 模型保存完成")

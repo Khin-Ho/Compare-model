@@ -1,0 +1,165 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib as jl
+import xgboost as xgb
+
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+
+# 引入所有你需要的模型
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+
+# ====================== 1. 基础设置 ======================
+# 解决画图中文乱码
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+DATA_PATH = r"E:\桌面\Milk\总数据库-平均强度.xlsx"
+SAVE_FOLDER = r"E:\桌面\Milk\model_comparison_results"
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# ====================== 2. 数据准备与特征工程 ======================
+print("1. 读取数据并构建特征...")
+df = pd.read_excel(DATA_PATH)
+df = df.rename(columns={'PS(%)': 'PS', 'KOH(%)': 'KOH'})
+
+# --- 核心特征构造 (不含温度，保证逻辑正确) ---
+# (1) 反应强度 (替代温度)
+df['Reaction_Intensity'] = df['PS'] * df['KOH']
+# (2) 酸碱配比
+df['Dosage_Ratio'] = df['PS'] / (df['KOH'] + 0.01)
+# (3) 降解潜力
+df['Degradation_Potential'] = (df['R1o'] + df['R2o']) / (df['R5o'] + 0.01)
+# (4) 总有机质
+df['Total_Ro'] = df['R1o'] + df['R2o'] + df['R3o'] + df['R4o'] + df['R5o']
+
+# 定义 X (特征)
+features = [
+    'PS', 'KOH',
+    'R1o', 'R2o', 'R3o', 'R4o', 'R5o',
+    'Reaction_Intensity', 'Dosage_Ratio', 'Degradation_Potential', 'Total_Ro'
+]
+X = df[features].values
+
+# 定义 Y (目标) - 这里我们对 Y 也进行归一化，这对 SVR 和 KNN 很重要
+y = df['HIX'].values.reshape(-1, 1)
+scaler_y = MinMaxScaler()
+y_scaled = scaler_y.fit_transform(y).ravel()
+
+# ====================== 3. 数据划分 ======================
+X_train, X_test, y_train_scaled, y_test_scaled = train_test_split(
+    X, y_scaled, test_size=0.2, random_state=42
+)
+
+# 对 X 进行标准化
+scaler_X = StandardScaler()
+X_train_scaled = scaler_X.fit_transform(X_train)
+X_test_scaled = scaler_X.transform(X_test)
+
+# 保存标尺
+jl.dump(scaler_X, os.path.join(SAVE_FOLDER, "scaler_X.pkl"))
+jl.dump(scaler_y, os.path.join(SAVE_FOLDER, "scaler_y.pkl"))
+
+# ====================== 4. 定义模型库与参数网格 ======================
+models = {
+    "Ridge": Ridge(),
+    "KNN": KNeighborsRegressor(),
+    "SVR": SVR(),
+    "DecisionTree": DecisionTreeRegressor(random_state=42),
+    "RandomForest": RandomForestRegressor(random_state=42),
+    "GradientBoosting": GradientBoostingRegressor(random_state=42),
+    "XGBoost": xgb.XGBRegressor(random_state=42, n_jobs=1)
+}
+
+# 参数网格 (根据你的代码保留)
+param_grid = {
+    'Ridge': {'alpha': [0.1, 1, 5, 10]},
+    'KNN': {'n_neighbors': [3, 5, 7, 9], 'weights': ['uniform', 'distance']},
+    'SVR': {'C': [1, 10, 20], 'epsilon': [0.01, 0.1], 'kernel': ['rbf']},
+    'DecisionTree': {'max_depth': [3, 5, 7, 10], 'min_samples_split': [2, 5]},
+    'RandomForest': {'n_estimators': [100, 200], 'max_depth': [5, 8, 10]},
+    'GradientBoosting': {'n_estimators': [100, 200], 'learning_rate': [0.05, 0.1], 'max_depth': [3, 5]},
+    'XGBoost': {'n_estimators': [100, 200, 300], 'learning_rate': [0.05, 0.1], 'max_depth': [3, 5, 7]}
+}
+
+# ====================== 5. 循环训练与评估 ======================
+results_list = []
+
+print(f"\n======== 开始训练 {len(models)} 个模型 ========")
+
+for name, model in models.items():
+    print(f"正在训练: {name} ...")
+
+    # 网格搜索
+    grid = GridSearchCV(model, param_grid[name], cv=5, scoring='r2', n_jobs=1)
+    grid.fit(X_train_scaled, y_train_scaled)
+
+    best_model = grid.best_estimator_
+
+    # --- 预测 ---
+    y_pred_train_scaled = best_model.predict(X_train_scaled)
+    y_pred_test_scaled = best_model.predict(X_test_scaled)
+
+    # --- 重要：将预测结果反归一化 (变回真实的 HIX 值) 以便计算 RMSE/MAE ---
+    y_train_real = scaler_y.inverse_transform(y_train_scaled.reshape(-1, 1)).ravel()
+    y_pred_train_real = scaler_y.inverse_transform(y_pred_train_scaled.reshape(-1, 1)).ravel()
+
+    y_test_real = scaler_y.inverse_transform(y_test_scaled.reshape(-1, 1)).ravel()
+    y_pred_test_real = scaler_y.inverse_transform(y_pred_test_scaled.reshape(-1, 1)).ravel()
+
+    # --- 计算指标 ---
+    # R2 (越大越好)
+    train_r2 = r2_score(y_train_real, y_pred_train_real)
+    test_r2 = r2_score(y_test_real, y_pred_test_real)
+
+    # RMSE (均方根误差，越小越好)
+    test_rmse = np.sqrt(mean_squared_error(y_test_real, y_pred_test_real))
+
+    # MAE (平均绝对误差，越小越好)
+    test_mae = mean_absolute_error(y_test_real, y_pred_test_real)
+
+    print(f"  -> {name} 结果: Test R2 = {test_r2:.4f} | RMSE = {test_rmse:.4f}")
+
+    # 保存模型
+    jl.dump(best_model, os.path.join(SAVE_FOLDER, f"{name}.pkl"))
+
+    results_list.append({
+        'Model': name,
+        'Train_R2': train_r2,
+        'Test_R2': test_r2,
+        'RMSE': test_rmse,
+        'MAE': test_mae,
+        'Best_Params': str(grid.best_params_)
+    })
+
+# ====================== 6. 结果汇总与可视化 ======================
+results_df = pd.DataFrame(results_list)
+
+# 按照 Test R2 排序，谁高谁在上面
+results_df = results_df.sort_values(by='Test_R2', ascending=False)
+
+# 保存 CSV
+results_df.to_csv(os.path.join(SAVE_FOLDER, 'All_Models_Comparison.csv'), index=False)
+
+print("\n======== 最终大比武结果 (按 R2 排序) ========")
+print(results_df[['Model', 'Test_R2', 'RMSE', 'MAE']])
+
+# 画图
+plt.figure(figsize=(12, 6))
+sns.barplot(x='Test_R2', y='Model', data=results_df, palette='viridis')
+plt.title('各模型测试集 R2 分数对比 (越高越好)')
+plt.xlim(0, 1.0)  # R2理论最大是1
+plt.grid(axis='x', linestyle='--', alpha=0.7)
+plt.tight_layout()
+plt.savefig(os.path.join(SAVE_FOLDER, 'Model_Comparison_Plot.png'), dpi=300)
+plt.show()
+
+print(f"\n所有结果已保存至: {SAVE_FOLDER}")

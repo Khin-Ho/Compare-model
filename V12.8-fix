@@ -1,0 +1,100 @@
+import matplotlib
+# ====================== 修复报错的关键 ======================
+# 强制使用 TkAgg 后端，解决 PyCharm 报错问题
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import r2_score
+
+# ====================== 1. 读取数据 ======================
+DATA_PATH = r"E:\桌面\Milk\总数据库-平均强度.xlsx"
+print(f"正在读取: {DATA_PATH}")
+df = pd.read_excel(DATA_PATH)
+df = df.rename(columns={'PS(%)': 'PS', 'KOH(%)': 'KOH'})
+
+# ====================== 2. 数据体检报告 ======================
+print("\n========== [1] 数据基础体检 ==========")
+print(f"数据总行数: {df.shape[0]}")
+print(f"特征总列数: {df.shape[1]}")
+print("\n目标值 HIX 的统计分布:")
+print(df['HIX'].describe())
+
+# ====================== 3. 关键：计算相关性 (Correlation) ======================
+# 如果这一步算出来的相关系数都很低（比如都在 0.1 以下），说明X和Y根本没关系
+print("\n========== [2] 特征与 HIX 的相关性 ==========")
+
+# 构造我们关心的特征
+df['Reaction_Intensity'] = df['PS'] * df['KOH']
+df['Dosage_Ratio'] = df['PS'] / (df['KOH'] + 0.01)
+df['Degradation_Potential'] = (df['R1o'] + df['R2o']) / (df['R5o'] + 0.01)
+
+check_cols = ['PS', 'KOH', 'Reaction_Intensity', 'Dosage_Ratio', 'Degradation_Potential', 'R1o', 'R5o', 'HIX']
+corr_matrix = df[check_cols].corr()
+
+# 只看与 HIX 的相关性
+hix_corr = corr_matrix['HIX'].sort_values(ascending=False)
+print(hix_corr)
+
+# 画热力图
+plt.figure(figsize=(10, 8))
+sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', fmt=".2f")
+plt.title("特征相关性热力图 (红色越深关系越紧密)")
+plt.tight_layout()
+plt.show()
+
+# ====================== 4. 视觉诊断：X vs Y 散点图 ======================
+# 看看 PS 和 HIX 到底有没有肉眼可见的规律
+plt.figure(figsize=(12, 5))
+
+plt.subplot(1, 2, 1)
+plt.scatter(df['PS'], df['HIX'], alpha=0.7, c='blue')
+plt.xlabel('PS Dosage')
+plt.ylabel('HIX')
+plt.title('PS vs HIX (散点分布)')
+
+plt.subplot(1, 2, 2)
+plt.scatter(df['Reaction_Intensity'], df['HIX'], alpha=0.7, c='red')
+plt.xlabel('Reaction Intensity (PS*KOH)')
+plt.ylabel('HIX')
+plt.title('PS*KOH vs HIX (散点分布)')
+
+plt.tight_layout()
+plt.show()
+
+# ====================== 5. 简单模型测试 (只用随机森林) ======================
+print("\n========== [3] 简单模型验证 ==========")
+# 既然复杂模型不行，我们只用最重要的特征跑一次
+feature_cols = ['PS', 'KOH', 'Reaction_Intensity', 'Degradation_Potential']
+X = df[feature_cols].values
+y = df['HIX'].values
+
+# 换个随机种子试试，有时候是运气不好
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=888)
+
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
+
+model = RandomForestRegressor(n_estimators=100, max_depth=5, random_state=888)
+model.fit(X_train, y_train)
+
+train_pred = model.predict(X_train)
+test_pred = model.predict(X_test)
+
+print(f"训练集 R2: {r2_score(y_train, train_pred):.3f}")
+print(f"测试集 R2: {r2_score(y_test, test_pred):.3f}")
+
+# 画出预测对比图
+plt.figure(figsize=(6, 6))
+plt.scatter(y_test, test_pred, color='green')
+plt.plot([y.min(), y.max()], [y.min(), y.max()], 'k--', lw=2) # 画一条对角线
+plt.xlabel('真实值 (True HIX)')
+plt.ylabel('预测值 (Predicted HIX)')
+plt.title('真实值 vs 预测值 (点应该在虚线附近)')
+plt.show()

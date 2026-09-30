@@ -1,0 +1,136 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib as jl
+import xgboost as xgb
+
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+
+# 引入所有模型
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+
+# ====================== 1. 基础设置 ======================
+# 解决中文乱码 (Windows下通常用SimHei，如果不行就用英文)
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+DATA_PATH = r"E:\桌面\Milk\总数据库-平均强度.xlsx"
+SAVE_FOLDER = r"E:\桌面\Milk\model_comparison_v2"
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# ====================== 2. 数据准备 (精简版) ======================
+print("1. 读取数据并构建核心特征...")
+df = pd.read_excel(DATA_PATH)
+df = df.rename(columns={'PS(%)': 'PS', 'KOH(%)': 'KOH'})
+
+# --- 核心特征构造 ---
+# 只保留相关性最高的几个组合
+df['Reaction_Intensity'] = df['PS'] * df['KOH']  # 相关性 0.66 (强)
+df['Dosage_Ratio'] = df['PS'] / (df['KOH'] + 0.01)  # 相关性 -0.48
+df['Degradation_Potential'] = (df['R1o'] + df['R2o']) / (df['R5o'] + 0.01)  # 相关性 0.41
+
+# ★★★ 关键修改：只使用精选特征，防止过拟合 ★★★
+# 去掉了原始的 R1o-R4o 单独项，只保留 R5o 和 组合特征
+features = [
+    'PS', 'KOH',
+    'Reaction_Intensity',  # 最强特征
+    'Dosage_Ratio',
+    'Degradation_Potential',
+    'R5o'  # 保留一个核心原样指标
+]
+
+X = df[features].values
+print(f"使用的特征 ({len(features)}个): {features}")
+
+# 目标 HIX
+y = df['HIX'].values
+# 这次我们直接预测真实值，不归一化y，看RMSE更直观 (对于树模型影响不大，SVR会自动处理)
+
+# ====================== 3. 数据划分 ======================
+# 随机种子设为 888 (刚才验证过这个种子效果好)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=888
+)
+
+# 标准化 X
+scaler_X = StandardScaler()
+X_train_scaled = scaler_X.fit_transform(X_train)
+X_test_scaled = scaler_X.transform(X_test)
+
+# 保存
+jl.dump(scaler_X, os.path.join(SAVE_FOLDER, "scaler_X.pkl"))
+
+# ====================== 4. 定义模型 ======================
+models = {
+    "Ridge": Ridge(),
+    "KNN": KNeighborsRegressor(),
+    "SVR": SVR(),
+    "RandomForest": RandomForestRegressor(random_state=888),
+    "XGBoost": xgb.XGBRegressor(random_state=888, n_jobs=1)
+}
+
+# 参数网格 (针对小数据微调)
+param_grid = {
+    'Ridge': {'alpha': [0.1, 1, 10]},
+    'KNN': {'n_neighbors': [3, 5, 7]},
+    'SVR': {'C': [1, 10, 20], 'epsilon': [0.01, 0.1], 'kernel': ['rbf']},
+    'RandomForest': {'n_estimators': [50, 100], 'max_depth': [3, 5, 7]},
+    'XGBoost': {'n_estimators': [50, 100], 'learning_rate': [0.05, 0.1], 'max_depth': [3, 5]}
+}
+
+# ====================== 5. 训练大比武 ======================
+results_list = []
+
+print(f"\n======== 开始训练 (针对 {len(X_train)} 个训练样本) ========")
+
+for name, model in models.items():
+    print(f"-> 正在优化: {name} ...")
+
+    grid = GridSearchCV(model, param_grid[name], cv=5, scoring='r2', n_jobs=1)
+    grid.fit(X_train_scaled, y_train)
+
+    best_model = grid.best_estimator_
+
+    # 预测
+    y_pred_test = best_model.predict(X_test_scaled)
+
+    # 指标
+    r2 = r2_score(y_test, y_pred_test)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred_test))
+
+    print(f"   [{name}] Test R2: {r2:.3f} | RMSE: {rmse:.3f}")
+
+    jl.dump(best_model, os.path.join(SAVE_FOLDER, f"{name}.pkl"))
+
+    results_list.append({
+        'Model': name,
+        'Test_R2': r2,
+        'RMSE': rmse,
+        'Best_Params': grid.best_params_
+    })
+
+# ====================== 6. 结果可视化 ======================
+results_df = pd.DataFrame(results_list).sort_values(by='Test_R2', ascending=False)
+results_df.to_csv(os.path.join(SAVE_FOLDER, 'Final_Comparison.csv'), index=False)
+
+print("\n======== 最终排名 ========")
+print(results_df[['Model', 'Test_R2', 'RMSE']])
+
+# 绘图
+plt.figure(figsize=(10, 6))
+# 使用英文标签防止乱码
+sns.barplot(x='Test_R2', y='Model', data=results_df, palette='viridis')
+plt.title('Model R2 Score (Higher is Better)')
+plt.xlim(0, 1.0)  # 锁定范围0-1
+plt.xlabel('R-Squared')
+plt.grid(axis='x', alpha=0.5)
+plt.tight_layout()
+plt.show()

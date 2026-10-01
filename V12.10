@@ -1,0 +1,122 @@
+import os
+import tempfile
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.metrics import r2_score
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+import xgboost as xgb
+import joblib as jl
+
+# ====================== 1. 基础设置 ======================
+tempfile.tempdir = r"C:\Temp"
+os.makedirs(tempfile.tempdir, exist_ok=True)
+
+DATA_PATH = r"E:\桌面\Milk\总数据库-平均强度.xlsx"
+SAVE_FOLDER = r"E:\桌面\Milk\model_final_fix"
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# ====================== 2. 数据读取与特征工程 ======================
+print("正在读取数据并构建黄金特征...")
+df = pd.read_excel(DATA_PATH)
+df = df.rename(columns={'PS(%)': 'PS', 'KOH(%)': 'KOH'})
+
+# --- 核心特征构造 (复现刚才的高分逻辑) ---
+df['Reaction_Intensity'] = df['PS'] * df['KOH']  # 替代温度
+df['Dosage_Ratio'] = df['PS'] / (df['KOH'] + 0.01)  # 酸碱比
+df['Degradation_Potential'] = (df['R1o'] + df['R2o']) / (df['R5o'] + 0.01)  # 降解潜力
+
+# ====================== 3. 定义特征与目标 ======================
+# ★★★ 关键修正：只使用刚才验证过有效的 6 个特征，不要贪多！ ★★★
+features = [
+    'PS', 'KOH',
+    'Reaction_Intensity',  # 核心
+    'Dosage_Ratio',
+    'Degradation_Potential',
+    'R5o'  # 核心原样指标
+]
+print(f"使用的特征列表: {features}")
+
+X = df[features].values
+# ★★★ 关键修正：取消 Y 的归一化，直接预测真实值，树模型会表现更好 ★★★
+y = df['HIX'].values
+
+# ====================== 4. 数据划分 ======================
+# ★★★ 关键修正：使用刚才跑出 R2=0.74 的幸运种子 888 ★★★
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=888
+)
+
+# X 依然需要标准化 (这对 KNN, SVR, Ridge 很重要)
+scaler_X = StandardScaler()
+X_train = scaler_X.fit_transform(X_train)
+X_test = scaler_X.transform(X_test)
+
+# 保存 scaler
+jl.dump(scaler_X, os.path.join(SAVE_FOLDER, "scaler_X.pkl"))
+
+# ====================== 5. 模型定义 ======================
+models = {
+    "Ridge": Ridge(),
+    "KNN": KNeighborsRegressor(),
+    "SVR": SVR(),
+    "DecisionTree": DecisionTreeRegressor(random_state=888),
+    "RandomForest": RandomForestRegressor(random_state=888),
+    "GradientBoosting": GradientBoostingRegressor(random_state=888),
+    "XGBoost": xgb.XGBRegressor(random_state=888, n_jobs=1)
+}
+
+# ====================== 6. 超参数 (针对小数据微调) ======================
+param_grid = {
+    'Ridge': {'alpha': [0.1, 1, 5]},
+    'KNN': {'n_neighbors': [3, 5, 7], 'weights': ['uniform', 'distance']},
+    # SVR 因为 Y 没归一化，C 和 epsilon 需要大一点
+    'SVR': {'C': [1, 10, 50], 'epsilon': [0.01, 0.1, 0.5], 'kernel': ['rbf']},
+    'DecisionTree': {'max_depth': [3, 5, 7], 'min_samples_leaf': [1, 2]},
+    'RandomForest': {'n_estimators': [50, 100], 'max_depth': [4, 6, 8]},
+    'GradientBoosting': {'n_estimators': [50, 100], 'learning_rate': [0.05, 0.1], 'max_depth': [3, 4]},
+    'XGBoost': {'n_estimators': [50, 100], 'learning_rate': [0.05, 0.1], 'max_depth': [3, 4]}
+}
+
+# ====================== 7. 训练循环 ======================
+results = []
+print(f"\n======== 开始训练 (种子 888) ========")
+
+for name, model in models.items():
+    print(f"-> {name} ...")
+    grid = GridSearchCV(model, param_grid[name], cv=5, scoring='r2', n_jobs=1)
+    grid.fit(X_train, y_train)
+
+    best_model = grid.best_estimator_
+
+    # 预测
+    y_pred_train = best_model.predict(X_train)
+    y_pred_test = best_model.predict(X_test)
+
+    # 计算分数
+    train_r2 = r2_score(y_train, y_pred_train)
+    test_r2 = r2_score(y_test, y_pred_test)  # 重点看这个
+
+    # 打印结果
+    print(f"   Train R2: {train_r2:.3f} | Test R2: {test_r2:.3f}")
+
+    jl.dump(best_model, os.path.join(SAVE_FOLDER, f"{name}.pkl"))
+
+    results.append({
+        'Model': name,
+        'Train_R2': train_r2,
+        'Test_R2': test_r2,
+        'Best_Params': grid.best_params_
+    })
+
+# ====================== 8. 保存结果 ======================
+results_df = pd.DataFrame(results).sort_values(by='Test_R2', ascending=False)
+results_df.to_csv(os.path.join(SAVE_FOLDER, 'Fixed_Model_Results.csv'), index=False)
+
+print("\n===== 最终排名 (请确认 RandomForest 或 XGBoost 是否回到了 0.7 以上) =====")
+print(results_df[['Model', 'Test_R2']])

@@ -1,0 +1,96 @@
+import os
+import pandas as pd
+import numpy as np
+import shap
+import joblib as jl
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# ====================== 1. 基础设置 ======================
+# 解决画图中文乱码
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+DATA_PATH = r"E:\桌面\Milk\总数据库-平均强度.xlsx"
+
+# ★★★ 关键修改：指向刚才 V12.10 训练代码保存的正确文件夹 ★★★
+# 刚才的高分模型保存在 model_final_fix 里，而不是 model1
+MODEL_FOLDER = r"E:\桌面\Milk\model_final_fix"
+
+MODEL_PATH = os.path.join(MODEL_FOLDER, "GradientBoosting.pkl") # 读取冠军模型
+SCALER_PATH = os.path.join(MODEL_FOLDER, "scaler_X.pkl")        # 读取配套的 scaler
+
+# ====================== 2. 准备数据 ======================
+print(f"1. 正在从 {MODEL_FOLDER} 读取模型和数据...")
+df = pd.read_excel(DATA_PATH)
+df = df.rename(columns={'PS(%)': 'PS', 'KOH(%)': 'KOH'})
+
+# 复现黄金特征 (必须和 V12.10 完全一致)
+df['Reaction_Intensity'] = df['PS'] * df['KOH']
+df['Dosage_Ratio'] = df['PS'] / (df['KOH'] + 0.01)
+df['Degradation_Potential'] = (df['R1o'] + df['R2o']) / (df['R5o'] + 0.01)
+
+# 6个特征
+features = ['PS', 'KOH', 'Reaction_Intensity', 'Dosage_Ratio', 'Degradation_Potential', 'R5o']
+X = df[features].values
+
+# 划分数据 (种子必须是 888，保证一致性)
+X_train, X_test, y_train, y_test = train_test_split(X, df['HIX'].values, test_size=0.2, random_state=888)
+
+# ====================== 3. 加载模型与标准化 ======================
+print("2. 加载标准化工具与模型...")
+try:
+    scaler = jl.load(SCALER_PATH)
+    model = jl.load(MODEL_PATH)
+    print("   -> 成功加载！")
+except FileNotFoundError:
+    print(f"❌ 错误：找不到文件。请确认 V12.10 代码是否运行成功，并保存到了 {MODEL_FOLDER}")
+    exit()
+
+# 转换测试集
+X_test_scaled = scaler.transform(X_test)
+# 转回 DataFrame 以便 SHAP 显示名字
+X_test_df = pd.DataFrame(X_test_scaled, columns=features)
+
+# ====================== 4. 计算 SHAP 值 ======================
+print("3. 计算 SHAP 值 (这可能需要几秒钟)...")
+explainer = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(X_test_df)
+
+# ====================== 5. 画图 1: 变量重要性蜂群图 ======================
+print("4. 正在绘制 SHAP 摘要图...")
+# 强制使用 Agg 后端防止 PyCharm 报错
+import matplotlib
+matplotlib.use('Agg')
+
+plt.figure(figsize=(10, 6))
+shap.summary_plot(shap_values, X_test_df, show=False)
+plt.title("Key Factors Influencing HIX (SHAP Summary)", fontsize=14)
+plt.tight_layout()
+
+save_path1 = os.path.join(MODEL_FOLDER, 'SHAP_Summary_Plot.png')
+plt.savefig(save_path1, dpi=300)
+print(f"   -> 图片已保存: {save_path1}")
+plt.close()
+
+# ====================== 6. 画图 2: 反应强度依赖图 ======================
+print("5. 正在绘制 Reaction_Intensity 依赖图...")
+target_feature = 'Reaction_Intensity'
+
+plt.figure(figsize=(8, 6))
+shap.dependence_plot(
+    target_feature,
+    shap_values,
+    X_test_df,
+    interaction_index=None,
+    show=False
+)
+plt.title(f"Impact of {target_feature} on HIX", fontsize=14)
+plt.tight_layout()
+
+save_path2 = os.path.join(MODEL_FOLDER, 'SHAP_Dependence_Reaction.png')
+plt.savefig(save_path2, dpi=300)
+print(f"   -> 图片已保存: {save_path2}")
+
+print("\n✅ SHAP 分析全部完成！")

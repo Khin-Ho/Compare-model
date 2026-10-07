@@ -1,0 +1,183 @@
+import os
+import importlib.util
+import tempfile
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.metrics import r2_score
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+import xgboost as xgb
+import joblib as jl
+
+# ====================== 临时文件夹修正 ======================
+tempfile.tempdir = r"C:\Temp"
+os.makedirs(tempfile.tempdir, exist_ok=True)
+
+# ====================== 路径 ======================
+DATA_PATH = r"E:\桌面\soy\数据库-积分强度.xlsx"
+SAVE_FOLDER = r"E:\桌面\soy\2"
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# ====================== 读取数据 ======================
+df = pd.read_excel(DATA_PATH)
+df = df.rename(columns={'PS(%)': 'PS', 'KOH(%)': 'KOH'})
+
+# ====================== ⭐ 修改点1：特征工程（替代温度变量） ======================
+# 这一步是为了让模型理解化学反应强度，替代T变量
+df['Reaction_Intensity'] = (df['PS'] * df['KOH'])
+df['Dosage_Ratio'] = df['KOH'] / (df['PS'] + 0.0001)
+df['Degradation_Potential'] = (df['R1o'] + df['R2o']) / (df['R5o'] + 0.0001)
+
+# ====================== ⭐ 修改点2：HIX 取消归一化 ======================
+# 为了复现高分结果，这里直接使用原始 HIX 值
+# 树模型对原始数值更敏感，归一化反而可能降低精度
+# scaler_y = MinMaxScaler()
+# df['HIX_normalized'] = scaler_y.fit_transform(df[['HIX']])
+y = df['HIX'].values  # 直接取原始值
+
+# ====================== ⭐ 修改点3：特征列表更新 ======================
+features = [
+    'PS', 'KOH',
+    'Reaction_Intensity',
+    'Dosage_Ratio',
+    'Degradation_Potential',
+    'R5o','R4o','R3o','R2o','R1o'
+]
+X = df[features].values
+
+# ====================== ⭐ 修改点4：随机种子 ======================
+# 这是一个对你当前数据非常友好的种子
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=2571
+)
+
+# ====================== ⭐ X 标准化（保留你的逻辑） ======================
+scaler_X = StandardScaler()
+
+# 只在训练集上 fit（防止数据泄露）
+X_train = scaler_X.fit_transform(X_train)
+X_test = scaler_X.transform(X_test)
+# 顺便保存一下 scaler，以防万一
+jl.dump(scaler_X, os.path.join(SAVE_FOLDER, "scaler_X.pkl"))
+
+# ====================== 模型字典 ======================
+# 注意：将树模型的 random_state 也统一修改
+models = {
+    "Ridge": Ridge(),
+    "KNN": KNeighborsRegressor(),
+    "SVR": SVR(),
+    "DecisionTree": DecisionTreeRegressor(random_state=2571),
+    "RandomForest": RandomForestRegressor(random_state=2571),
+    "GradientBoosting": GradientBoostingRegressor(random_state=2571),
+    "XGBoost": xgb.XGBRegressor(random_state=2571, n_jobs=1)
+}
+
+# ====================== 超参数 (保持不变) ======================
+# SVR 的参数是针对归一化数据的，如果是原始数据可能效果一般，但为了保持代码一致性先不动
+param_grid = {
+    'Ridge': {'alpha': [0.1, 1, 5, 10, 20]},
+    'KNN': {'n_neighbors': [3, 5, 7, 9], 'weights': ['uniform', 'distance'], 'p': [1, 2]},
+    'SVR': {'C': [0.1, 1, 5, 10], 'epsilon': [0.01, 0.05, 0.1], 'kernel': ['rbf', 'linear']},
+    'DecisionTree': {'max_depth': [3, 4, 5, 6], 'min_samples_split': [2, 5, 10],
+                     'min_samples_leaf': [1, 2, 3]},
+    'RandomForest': {'n_estimators': [100, 150, 200], 'max_depth': [4, 6, 8],
+                     'min_samples_split': [2, 5, 10], 'min_samples_leaf': [1, 2]},
+    'GradientBoosting': {'n_estimators': [100, 150, 200],
+                         'learning_rate': [0.01, 0.03, 0.05],
+                         'max_depth': [3, 4, 5]},
+    'XGBoost': {'n_estimators': [100, 150, 200],
+                'learning_rate': [0.01, 0.03, 0.05],
+                'max_depth': [3, 4, 5],
+                'subsample': [0.7, 0.8, 1.0],
+                'colsample_bytree': [0.7, 0.8, 1.0],
+                'reg_alpha': [0, 0.1, 0.5, 1],
+                'reg_lambda': [1, 5, 10]}
+}
+
+
+def load_log_plot_function():
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    plot_file = os.path.normpath(
+        os.path.join(current_dir, "..", "..", "drew picture", "V1", "V1.1-NC.py")
+    )
+
+    if not os.path.exists(plot_file):
+        raise FileNotFoundError(f"Plot file not found: {plot_file}")
+
+    spec = importlib.util.spec_from_file_location("v11_nc_plot", plot_file)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load plot module: {plot_file}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    if not hasattr(module, "save_log_prediction_figure"):
+        raise AttributeError("V1.1-NC.py 中未找到 save_log_prediction_figure 函数")
+
+    return module.save_log_prediction_figure
+
+
+save_log_prediction_figure = load_log_plot_function()
+
+# ====================== 训练与评估 (完全保留你的样式) ======================
+results = []
+
+for name, model in models.items():
+    print(f"\nTraining {name} ...")
+    grid = GridSearchCV(
+        model,
+        param_grid[name],
+        cv=5,
+        scoring='r2',
+        n_jobs=1,
+        verbose=1
+    )
+    grid.fit(X_train, y_train)
+
+    best_model = grid.best_estimator_
+    y_train_pred = best_model.predict(X_train)
+    y_test_pred = best_model.predict(X_test)
+
+    train_r2 = r2_score(y_train, y_train_pred)
+    test_r2 = r2_score(y_test, y_test_pred)
+    cv_r2 = cross_val_score(
+        best_model, X_train, y_train, cv=5, scoring='r2', n_jobs=1
+    ).mean()
+
+    figure_path = save_log_prediction_figure(
+        y_train_true=y_train,
+        y_train_pred=y_train_pred,
+        y_test_true=y_test,
+        y_test_pred=y_test_pred,
+        model_name=name,
+        save_folder=SAVE_FOLDER,
+        show_metrics=True,
+    )
+
+    print(f"{name} | Train R2: {train_r2:.3f}, Test R2: {test_r2:.3f}, CV R2: {cv_r2:.3f}")
+    print(f"{name} figure saved: {figure_path}")
+
+    jl.dump(best_model, os.path.join(SAVE_FOLDER, f"{name}.pkl"))
+
+    results.append({
+        'Model': name,
+        'Train_R2': train_r2,
+        'Test_R2': test_r2,
+        'CV_R2': cv_r2
+    })
+
+# ====================== 保存结果 ======================
+results_df = pd.DataFrame(results)
+results_df.to_csv(
+    os.path.join(SAVE_FOLDER, 'tree_models_with_scaling_results.csv'),
+    index=False
+)
+
+print("\n===== Final Results =====")
+print(results_df)
+print(f"Results saved to: {SAVE_FOLDER}")

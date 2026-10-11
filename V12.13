@@ -1,0 +1,166 @@
+import os
+import tempfile
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+import xgboost as xgb
+import joblib as jl
+
+# ====================== 临时文件夹修正 ======================
+tempfile.tempdir = r"C:\Temp"
+os.makedirs(tempfile.tempdir, exist_ok=True)
+
+# ====================== 路径 ======================
+DATA_PATH = r"E:\桌面\Milk\数据库-积分强度.xlsx"
+SAVE_FOLDER = r"E:\桌面\Milk\数据库-积分强度" # 改个文件夹名，方便对比
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# ====================== 读取数据 ======================
+df = pd.read_excel(DATA_PATH)
+df = df.rename(columns={'PS(%)': 'PS', 'KOH(%)': 'KOH'})
+
+# ====================== ⭐ 核心修改 1：特征工程 (替代 Delta) ======================
+print("正在构建预测型特征 (Reaction Intensity, etc.)...")
+# 使用实验前已知的变量，构建化学逻辑特征
+df['Reaction_Intensity'] = df['PS'] * df['KOH']
+df['Dosage_Ratio'] = df['PS'] / (df['KOH'] + 0.01)
+df['Degradation_Potential'] = (df['R1o'] + df['R2o']) / (df['R5o'] + 0.01)
+
+# ====================== ⭐ 核心修改 2：Y 取消归一化 ======================
+# 为了让树模型发挥最大威力，直接预测真实 HIX 值
+# scaler_y = MinMaxScaler()
+# df['HIX_normalized'] = scaler_y.fit_transform(df[['HIX']])
+y = df['HIX'].values  # 直接使用原始值
+
+# ====================== ⭐ 核心修改 3：特征列表 ======================
+# 仅仅使用这 6 个“黄金特征”
+features = [
+    'Reaction_Intensity','PS','KOH',
+    'Dosage_Ratio',
+    'Degradation_Potential',
+    'R1o','R2o','R5o'
+]
+print(f"使用的特征: {features}")
+
+X = df[features].values
+
+# ====================== 划分数据 (种子 888) ======================
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=2638
+)
+
+# ====================== X 标准化 ======================
+scaler_X = StandardScaler()
+X_train = scaler_X.fit_transform(X_train)
+X_test = scaler_X.transform(X_test)
+
+# ====================== 模型字典 (种子 888) ======================
+models = {
+    "Ridge": Ridge(),
+    "KNN": KNeighborsRegressor(),
+    "SVR": SVR(),
+    "DecisionTree": DecisionTreeRegressor(random_state=2638),
+    "RandomForest": RandomForestRegressor(random_state=2638),
+    "GradientBoosting": GradientBoostingRegressor(random_state=2638),
+    "XGBoost": xgb.XGBRegressor(random_state=2638, n_jobs=1)
+}
+
+# ====================== 超参数 (针对 Raw Y 微调) ======================
+param_grid = {
+    'Ridge': {'alpha': [0.1, 1, 5, 10, 20]},
+    'KNN': {'n_neighbors': [3, 5, 7, 9], 'weights': ['uniform', 'distance'], 'p': [1, 2]},
+    # SVR 参数范围扩大，因为 Y 变成了真实值 (0-15左右)，不是 0-1 了
+    'SVR': {'C': [1, 10, 50], 'epsilon': [0.01, 0.1, 0.5], 'kernel': ['rbf', 'linear']},
+    'DecisionTree': {'max_depth': [3, 4, 5, 6],
+                     'min_samples_split': [2, 5, 10],
+                     'min_samples_leaf': [1, 2, 3]},
+    'RandomForest': {'n_estimators': [100, 150, 200],
+                     'max_depth': [4, 6, 8],
+                     'min_samples_split': [2, 5, 10],
+                     'min_samples_leaf': [1, 2]},
+    'GradientBoosting': {'n_estimators': [100, 150, 200],
+                         'learning_rate': [0.01, 0.03, 0.05],
+                         'max_depth': [3, 4, 5]},
+    'XGBoost': {'n_estimators': [100, 150, 200],
+                'learning_rate': [0.01, 0.03, 0.05],
+                'max_depth': [3, 4, 5],
+                'subsample': [0.7, 0.8, 1.0],
+                'colsample_bytree': [0.7, 0.8, 1.0],
+                'reg_alpha': [0, 0.1, 0.5, 1],
+                'reg_lambda': [1, 5, 10]}
+}
+
+# ====================== 训练与评估 ======================
+results = []
+
+for name, model in models.items():
+    print(f"\nTraining {name} ...")
+
+    grid = GridSearchCV(
+        model,
+        param_grid[name],
+        cv=5,
+        scoring='r2',
+        n_jobs=1,
+        verbose=1
+    )
+    grid.fit(X_train, y_train)
+
+    best_model = grid.best_estimator_
+
+    # ===== Train R2 =====
+    train_r2 = r2_score(y_train, best_model.predict(X_train))
+
+    # ===== Test RMSE / MAE =====
+    y_test_pred = best_model.predict(X_test)
+    rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+    mae = mean_absolute_error(y_test, y_test_pred)
+    # 算一下 Test R2，方便你看结果是否回到了 0.7
+    test_r2 = r2_score(y_test, y_test_pred)
+
+    # ===== CV R2 =====
+    cv_r2 = cross_val_score(
+        best_model,
+        X_train,
+        y_train,
+        cv=5,
+        scoring='r2',
+        n_jobs=1
+    ).mean()
+
+    # 保持你的输出格式，但我多加了一个 Test R2 让你放心
+    print(
+        f"{name} | Train R2: {train_r2:.3f}, "
+        f"CV R2: {cv_r2:.3f}, "
+        f"Test R2: {test_r2:.3f}, "  # 新增，让你确认模型好了
+        f"Test RMSE: {rmse:.3f}, Test MAE: {mae:.3f}"
+    )
+
+    jl.dump(best_model, os.path.join(SAVE_FOLDER, f"{name}.pkl"))
+
+    results.append({
+        'Model': name,
+        'Train_R2': train_r2,
+        'CV_R2': cv_r2,
+        'Test_R2': test_r2,
+        'Test_RMSE': rmse,
+        'Test_MAE': mae
+    })
+
+# ====================== 保存结果 ======================
+results_df = pd.DataFrame(results)
+results_df.to_csv(
+    os.path.join(SAVE_FOLDER, 'models_RMSE_MAE_results.csv'),
+    index=False
+)
+
+print("\n===== Final Results =====")
+print(results_df)
+print(f"Results saved to: {SAVE_FOLDER}")

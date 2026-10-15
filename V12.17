@@ -1,0 +1,157 @@
+import os
+import tempfile
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler  # 引入抗干扰Scaler
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.metrics import r2_score
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+import xgboost as xgb
+import joblib as jl
+
+# ====================== 临时文件夹修正 ======================
+tempfile.tempdir = r"C:\Temp"
+os.makedirs(tempfile.tempdir, exist_ok=True)
+
+# ====================== 路径 ======================
+DATA_PATH = r"E:\桌面\Milk\1.xlsx"
+SAVE_FOLDER = r"E:\桌面\Milk\model2_optimized"  # 我改了个文件夹名，避免覆盖你之前的
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# ====================== 读取数据 ======================
+df = pd.read_excel(DATA_PATH)
+df = df.rename(columns={'PS(%)': 'PS', 'KOH(%)': 'KOH'})
+
+# ====================== ⭐ 核心修改点：特征工程优化 ======================
+
+# 1. 交互项（CRITICAL FIX）：
+# 解决 6+6 vs 0+12 的问题。只有两者都不为0，乘积才大。
+# 这能帮模型识别 "缺一不可" 的化学逻辑。
+df['PS_KOH_Interact'] = df['PS'] * df['KOH']
+
+# 2. 反应总量（保留你的逻辑，作为辅助）：
+df['Reaction_Intensity'] = df['PS'] + df['KOH']
+
+# 3. 比例特征（CRITICAL FIX）：
+# 使用 np.log1p (log(x+1)) 替代直接相除。
+# 如果 PS=0, 原来是 120000 (爆炸)，现在是 log(1200) ≈ 7 左右。
+# 这样既保留了比例关系，又不会产生让 KNN/Ridge 崩溃的巨型数值。
+df['Dosage_Ratio_Log'] = np.log1p(df['KOH'] / (df['PS'] + 0.01))
+
+# 4. 荧光特征：
+df['Degradation_Potential'] = (df['R1o'] + df['R2o']) / (df['R5o'] + 0.0001)
+
+# ====================== 目标变量 ======================
+y = df['HIX'].values
+
+# ====================== ⭐ 更新特征列表 ======================
+features = [
+    'PS', 'KOH',
+    'PS_KOH_Interact',      # 新增核心特征
+    'Reaction_Intensity',
+    'Dosage_Ratio_Log',     # 修改后的比例特征
+    'Degradation_Potential',
+    'R5o','R4o','R3o','R2o','R1o'
+]
+X = df[features].values
+
+# ====================== 切分数据 ======================
+# 保持你的 lucky seed
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=3379
+)
+
+# ====================== ⭐ 修改点：使用 RobustScaler ======================
+# StandardScaler 用均值和方差，会被 0+12 这种极端数据拉偏。
+# RobustScaler 使用四分位数，对离群点（Outliers）不敏感，非常适合包含极端条件的数据集。
+scaler_X = RobustScaler()
+
+X_train = scaler_X.fit_transform(X_train)
+X_test = scaler_X.transform(X_test)
+
+# 保存 scaler
+jl.dump(scaler_X, os.path.join(SAVE_FOLDER, "scaler_X_robust.pkl"))
+
+# ====================== 模型字典 ======================
+models = {
+    "Ridge": Ridge(),
+    "KNN": KNeighborsRegressor(),
+    "SVR": SVR(),
+    "DecisionTree": DecisionTreeRegressor(random_state=3379),
+    "RandomForest": RandomForestRegressor(random_state=3379),
+    "GradientBoosting": GradientBoostingRegressor(random_state=3379),
+    "XGBoost": xgb.XGBRegressor(random_state=3379, n_jobs=1)
+}
+
+# ====================== 超参数 (保持不变) ======================
+param_grid = {
+    'Ridge': {'alpha': [0.1, 1, 5, 10, 20]},
+    'KNN': {'n_neighbors': [3, 5, 7, 9], 'weights': ['uniform', 'distance'], 'p': [1, 2]},
+    'SVR': {'C': [0.1, 1, 5, 10], 'epsilon': [0.01, 0.05, 0.1], 'kernel': ['rbf', 'linear']},
+    'DecisionTree': {'max_depth': [3, 4, 5, 6], 'min_samples_split': [2, 5, 10],
+                     'min_samples_leaf': [1, 2, 3]},
+    'RandomForest': {'n_estimators': [100, 150, 200], 'max_depth': [4, 6, 8],
+                     'min_samples_split': [2, 5, 10], 'min_samples_leaf': [1, 2]},
+    'GradientBoosting': {'n_estimators': [100, 150, 200],
+                         'learning_rate': [0.01, 0.03, 0.05],
+                         'max_depth': [3, 4, 5]},
+    'XGBoost': {'n_estimators': [100, 150, 200],
+                'learning_rate': [0.01, 0.03, 0.05],
+                'max_depth': [3, 4, 5],
+                'subsample': [0.7, 0.8, 1.0],
+                'colsample_bytree': [0.7, 0.8, 1.0],
+                'reg_alpha': [0, 0.1, 0.5, 1],
+                'reg_lambda': [1, 5, 10]}
+}
+
+# ====================== 训练与评估 ======================
+results = []
+
+print("Starting training with optimized features and RobustScaler...")
+
+for name, model in models.items():
+    print(f"\nTraining {name} ...")
+    grid = GridSearchCV(
+        model,
+        param_grid[name],
+        cv=5,
+        scoring='r2',
+        n_jobs=1,
+        verbose=1
+    )
+    grid.fit(X_train, y_train)
+
+    best_model = grid.best_estimator_
+
+    train_r2 = r2_score(y_train, best_model.predict(X_train))
+    test_r2 = r2_score(y_test, best_model.predict(X_test))
+    cv_r2 = cross_val_score(
+        best_model, X_train, y_train, cv=5, scoring='r2', n_jobs=1
+    ).mean()
+
+    print(f"{name} | Train R2: {train_r2:.3f}, Test R2: {test_r2:.3f}, CV R2: {cv_r2:.3f}")
+
+    jl.dump(best_model, os.path.join(SAVE_FOLDER, f"{name}.pkl"))
+
+    results.append({
+        'Model': name,
+        'Train_R2': train_r2,
+        'Test_R2': test_r2,
+        'CV_R2': cv_r2,
+        'Best_Params': str(grid.best_params_)
+    })
+
+# ====================== 保存结果 ======================
+results_df = pd.DataFrame(results)
+results_df.to_csv(
+    os.path.join(SAVE_FOLDER, 'results_optimized.csv'),
+    index=False
+)
+
+print("\n===== Final Results (Optimized) =====")
+print(results_df[['Model', 'Train_R2', 'Test_R2', 'CV_R2']])
+print(f"Results saved to: {SAVE_FOLDER}")

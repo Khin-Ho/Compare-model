@@ -1,0 +1,224 @@
+import os
+import tempfile
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score, RepeatedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+
+import xgboost as xgb
+import joblib as jl
+
+# ====================== 临时文件夹修正 ======================
+tempfile.tempdir = r"C:\Temp"
+os.makedirs(tempfile.tempdir, exist_ok=True)
+
+# ====================== 路径 ======================
+DATA_PATH = r"E:\桌面\Milk\数据库-积分强度.xlsx"
+SAVE_FOLDER = r"E:\桌面\Milk\数据库-积分强度_V14"
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# ====================== 读取数据 ======================
+df = pd.read_excel(DATA_PATH)
+df = df.rename(columns={'PS(%)': 'PS', 'KOH(%)': 'KOH'})
+
+# ====================== 特征工程优化 ======================
+print("正在构建优化特征 (Chemistry-driven features)...")
+
+df['Reaction_Intensity'] = df['PS'] * df['KOH']
+df['Dosage_Ratio'] = df['PS'] / (df['KOH'] + 0.01)
+
+# EEM结构信息
+df['Humification_Index'] = df['R5o'] / (df['R1o'] + df['R2o'] + 0.01)
+
+df['Degradation_Potential'] = (df['R1o'] + df['R2o']) / (df['R5o'] + 0.01)
+
+# 最终特征（减少共线）
+features = [
+    'Reaction_Intensity',
+    'Dosage_Ratio',
+    'Humification_Index',
+    'Degradation_Potential'
+]
+
+print(f"使用的特征: {features}")
+
+X = df[features].values
+y = df['HIX'].values
+
+# ====================== 数据划分 ======================
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+# ====================== 标准化 ======================
+scaler_X = StandardScaler()
+X_train = scaler_X.fit_transform(X_train)
+X_test = scaler_X.transform(X_test)
+
+# ====================== CV策略（更稳定） ======================
+cv_strategy = RepeatedKFold(
+    n_splits=5,
+    n_repeats=10,
+    random_state=42
+)
+
+# ====================== 模型字典 ======================
+models = {
+
+    "Ridge": Ridge(),
+
+    "KNN": KNeighborsRegressor(),
+
+    "SVR": SVR(),
+
+    "DecisionTree": DecisionTreeRegressor(random_state=42),
+
+    "RandomForest": RandomForestRegressor(random_state=42),
+
+    "GradientBoosting": GradientBoostingRegressor(random_state=42),
+
+    "XGBoost": xgb.XGBRegressor(
+        random_state=42,
+        n_jobs=1
+    )
+}
+
+# ====================== 参数空间 ======================
+param_grid = {
+
+    'Ridge': {
+        'alpha': [0.1, 1, 5, 10, 20]
+    },
+
+    'KNN': {
+        'n_neighbors': [3,5,7,9],
+        'weights': ['uniform','distance'],
+        'p': [1,2]
+    },
+
+    'SVR': {
+        'C': [1,10,50,100],
+        'epsilon': [0.01,0.1,0.5],
+        'kernel': ['rbf','linear']
+    },
+
+    'DecisionTree': {
+        'max_depth': [3,4,5,6],
+        'min_samples_split': [2,5,10],
+        'min_samples_leaf': [1,2,3]
+    },
+
+    'RandomForest': {
+        'n_estimators': [100,150,200],
+        'max_depth': [4,6,8],
+        'min_samples_split': [2,5,10],
+        'min_samples_leaf': [1,2]
+    },
+
+    'GradientBoosting': {
+        'n_estimators': [100,150,200],
+        'learning_rate': [0.01,0.03,0.05],
+        'max_depth': [3,4,5]
+    },
+
+    'XGBoost': {
+        'n_estimators': [100,150,200],
+        'learning_rate': [0.01,0.03,0.05],
+        'max_depth': [3,4,5,6],
+        'subsample': [0.7,0.8,1.0],
+        'colsample_bytree': [0.7,0.8,1.0],
+        'min_child_weight':[1,3,5],
+        'reg_alpha': [0,0.1,0.5,1],
+        'reg_lambda': [1,5,10]
+    }
+}
+
+# ====================== 训练 ======================
+results = []
+
+for name, model in models.items():
+
+    print(f"\nTraining {name} ...")
+
+    grid = GridSearchCV(
+        model,
+        param_grid[name],
+        cv=cv_strategy,
+        scoring='r2',
+        n_jobs=1,
+        verbose=1
+    )
+
+    grid.fit(X_train, y_train)
+
+    best_model = grid.best_estimator_
+
+    # ===== Train =====
+    train_pred = best_model.predict(X_train)
+    train_r2 = r2_score(y_train, train_pred)
+
+    # ===== Test =====
+    y_test_pred = best_model.predict(X_test)
+
+    test_r2 = r2_score(y_test, y_test_pred)
+
+    rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+
+    mae = mean_absolute_error(y_test, y_test_pred)
+
+    # ===== CV =====
+    cv_r2 = cross_val_score(
+        best_model,
+        X_train,
+        y_train,
+        cv=cv_strategy,
+        scoring='r2',
+        n_jobs=1
+    ).mean()
+
+    gap = train_r2 - test_r2
+
+    print(
+        f"{name} | "
+        f"Train R2: {train_r2:.3f}, "
+        f"CV R2: {cv_r2:.3f}, "
+        f"Test R2: {test_r2:.3f}, "
+        f"Gap: {gap:.3f}, "
+        f"RMSE: {rmse:.3f}, "
+        f"MAE: {mae:.3f}"
+    )
+
+    jl.dump(best_model, os.path.join(SAVE_FOLDER, f"{name}.pkl"))
+
+    results.append({
+
+        'Model': name,
+        'Train_R2': train_r2,
+        'CV_R2': cv_r2,
+        'Test_R2': test_r2,
+        'Gap': gap,
+        'Test_RMSE': rmse,
+        'Test_MAE': mae
+
+    })
+
+# ====================== 保存结果 ======================
+results_df = pd.DataFrame(results)
+
+results_df.to_csv(
+    os.path.join(SAVE_FOLDER, 'model_results.csv'),
+    index=False
+)
+
+print("\n===== Final Results =====")
+print(results_df)
+
+print(f"\nResults saved to: {SAVE_FOLDER}")

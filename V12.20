@@ -1,0 +1,143 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+import xgboost as xgb
+import matplotlib.pyplot as plt
+import joblib
+
+# ======================
+# 读取数据
+# ======================
+
+DATA_PATH = r"E:\桌面\Milk\数据库-积分强度.xlsx"
+
+df = pd.read_excel(DATA_PATH)
+
+df = df.rename(columns={'PS(%)':'PS','KOH(%)':'KOH'})
+
+# ======================
+# 特征工程
+# ======================
+
+df['protein_like'] = df['R1o'] + df['R2o']
+df['humic_like'] = df['R4o'] + df['R5o']
+
+df['humic_ratio'] = df['humic_like']/(df['protein_like']+0.01)
+
+df['Reaction_Intensity'] = df['PS']*df['KOH']
+df['PS_KOH_ratio'] = df['PS']/(df['KOH']+0.01)
+
+df['PS_R1o'] = df['PS']*df['R1o']
+df['PS_R2o'] = df['PS']*df['R2o']
+
+df['KOH_R1o'] = df['KOH']*df['R1o']
+df['KOH_R2o'] = df['KOH']*df['R2o']
+
+df['heating_rate']=(df['Tmax']-df['Tstart'])/(df['tmax(min)']+0.01)
+df['reaction_heat']=df['Tmax']-df['Tenviroment']
+
+# ======================
+# 特征
+# ======================
+
+features=[
+
+'PS','KOH',
+
+'R1o','R2o','R3o','R4o','R5o',
+
+'protein_like','humic_like','humic_ratio',
+
+'Reaction_Intensity',
+'PS_KOH_ratio',
+
+'PS_R1o','PS_R2o',
+'KOH_R1o','KOH_R2o',
+
+'heating_rate',
+'reaction_heat'
+
+]
+
+X=df[features]
+y=df['HIX']
+
+# ======================
+# 划分数据
+# ======================
+
+X_train,X_test,y_train,y_test=train_test_split(
+
+X,y,
+test_size=0.2,
+random_state=1467
+
+)
+
+scaler=StandardScaler()
+
+X_train=scaler.fit_transform(X_train)
+X_test=scaler.transform(X_test)
+
+# ======================
+# XGBoost
+# ======================
+
+param_grid={
+
+'n_estimators':[200,300,400],
+
+'learning_rate':[0.01,0.03],
+
+'max_depth':[3,4],
+
+'subsample':[0.7,0.8],
+
+'colsample_bytree':[0.7,0.8],
+
+'gamma':[0,0.1]
+
+}
+
+model=xgb.XGBRegressor(random_state=42,n_jobs=1)
+
+grid=GridSearchCV(
+
+model,
+param_grid,
+cv=5,
+scoring='r2',
+n_jobs=1
+
+)
+
+grid.fit(X_train,y_train)
+
+best_model=grid.best_estimator_
+
+# ======================
+# 评估
+# ======================
+
+train_pred=best_model.predict(X_train)
+test_pred=best_model.predict(X_test)
+
+print("Train R2:",r2_score(y_train,train_pred))
+print("Test R2:",r2_score(y_test,test_pred))
+
+print("RMSE:",np.sqrt(mean_squared_error(y_test,test_pred)))
+print("MAE:",mean_absolute_error(y_test,test_pred))
+
+# ======================
+# 特征重要性
+# ======================
+
+importance=best_model.feature_importances_
+
+plt.figure(figsize=(8,6))
+plt.barh(features,importance)
+plt.title("Feature Importance")
+plt.show()

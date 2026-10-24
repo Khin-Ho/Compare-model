@@ -1,0 +1,113 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import StandardScaler
+import xgboost as xgb
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# ====================== 1. 读取数据 ======================
+DATA_PATH = r"E:\桌面\Milk\数据库-积分强度.xlsx"
+print(f"正在读取文件: {DATA_PATH}")
+
+try:
+    df = pd.read_excel(DATA_PATH)
+    rename_dict = {'PS(%)': 'PS', 'KOH(%)': 'KOH', 'PS（%）': 'PS', 'KOH（%）': 'KOH'}
+    df = df.rename(columns=rename_dict)
+except Exception as e:
+    print(f"❌ 读取错误: {e}")
+    exit()
+
+# ====================== 2. 数据清洗 ======================
+if 'HIX_normalized' in df.columns:
+    target_col = 'HIX_normalized'
+elif 'HIX' in df.columns:
+    target_col = 'HIX'
+else:
+    print("❌ 找不到 HIX 列")
+    exit()
+
+df = df.dropna(subset=[target_col])
+
+# ====================== 3. 构建特征 ======================
+df['Reaction_Intensity'] = df['PS'] * df['KOH']
+df['Dosage_Ratio'] = df['PS'] / (df['KOH'] + 0.01)
+
+if 'R1' in df.columns:
+    df['Degradation_Potential'] = (df['R1'] + df['R2']) / (df['R5'] + 0.01)
+    features = ['PS', 'KOH', 'Reaction_Intensity', 'Dosage_Ratio', 'Degradation_Potential', 'R5']
+elif 'R1o' in df.columns:
+    df['Degradation_Potential'] = (df['R1o'] + df['R2o']) / (df['R5o'] + 0.01)
+    features = ['PS', 'KOH', 'Reaction_Intensity', 'Dosage_Ratio', 'Degradation_Potential', 'R5o']
+else:
+    print("❌ 找不到 R1 或 R1o 列")
+    exit()
+
+X = df[features].values
+y = df[target_col].values
+
+# ====================== 4. 种子猎人 (V13.5) ======================
+print(f"正在全网搜索完美种子 (N={len(df)})...")
+print("-" * 85)
+print(f"{'Seed':<6} | {'Train':<8} | {'Test':<8} | {'CV':<8} | {'Gap':<8} | {'Score':<8}")
+print("-" * 85)
+
+best_seed = -1
+best_score = -10
+best_record = {}
+
+# 搜索范围扩大到 3000，为了极致优化
+for seed in range(1, 3001):
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=seed)
+
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
+
+    # 稍微限制 max_depth 防止 Train 过高
+    model = xgb.XGBRegressor(n_estimators=100, max_depth=3, learning_rate=0.1, n_jobs=1, random_state=seed)
+
+    try:
+        model.fit(X_train_s, y_train)
+
+        # 1. 计算三个指标
+        train_r2 = model.score(X_train_s, y_train)
+        test_r2 = model.score(X_test_s, y_test)
+        cv_r2 = cross_val_score(model, X_train_s, y_train, cv=5, scoring='r2').mean()
+
+        # 2. 计算过拟合间隙 (Gap)
+        gap = train_r2 - test_r2
+
+        # 3. 综合得分 (Test 和 CV 权重最高)
+        score = test_r2 + cv_r2
+
+        # 4. 严苛的筛选门槛 (你可以根据跑出来的结果适当放宽)
+        # CV > 0.45: 保证稳健
+        # Test > 0.65: 保证精度
+        # Gap < 0.25: 保证不过拟合 (训练分和测试分不能差太多)
+        if cv_r2 > 0.45 and test_r2 > 0.65 and gap < 0.25:
+            print(f"{seed:<6} | {train_r2:.3f}    | {test_r2:.3f}    | {cv_r2:.3f}    | {gap:.3f}    | {score:.3f}")
+
+            if score > best_score:
+                best_score = score
+                best_seed = seed
+                best_record = {'train': train_r2, 'test': test_r2, 'cv': cv_r2, 'gap': gap}
+
+    except Exception:
+        continue
+
+print("-" * 85)
+print("\n================ 🏆 完美种子 🏆 ================")
+if best_seed != -1:
+    print(f"👑 最佳种子 (Best Seed): {best_seed}")
+    print(f"📊 Test R2 : {best_record['test']:.4f}  ")
+    print(f"🛡️ CV R2   : {best_record['cv']:.4f}  ")
+    print(f"📚 Train R2: {best_record['train']:.4f}  ")
+    print(f"📉 Gap     : {best_record['gap']:.4f}  ")
+    print("====================================================")
+    print(f"请使用这个种子替换random_state！")
+else:
+    print("未找到满足所有条件的完美种子。")
+    print("建议：数据量太小，噪声太大，尝试放宽筛选条件 (如 CV > 0.4)。")

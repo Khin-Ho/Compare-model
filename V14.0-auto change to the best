@@ -1,0 +1,235 @@
+import optuna
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import StandardScaler
+import warnings
+import os
+
+# 忽略警告
+warnings.filterwarnings('ignore')
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+# ====================== 0. 设置 ======================
+BEST_SEED = 1830  # 你找到的冠军种子
+DATA_PATH = r"E:\桌面\Milk\积分milk.xlsx"
+SAVE_FOLDER = r"E:\桌面\Milk\model_optuna"
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# ====================== 1. 数据准备 (保持你的逻辑) ======================
+print(f"正在读取数据... (Seed={BEST_SEED})")
+
+try:
+    df = pd.read_excel(DATA_PATH)
+    # 改名
+    rename_dict = {'PS(%)': 'PS', 'KOH(%)': 'KOH', 'PS（%）': 'PS', 'KOH（%）': 'KOH'}
+    df = df.rename(columns=rename_dict)
+
+    # 确定目标列
+    if 'HIX_normalized' in df.columns:
+        target_col = 'HIX_normalized'
+    elif 'HIX' in df.columns:
+        target_col = 'HIX'
+    else:
+        target_col = 'HIX'  # 默认尝试 HIX
+
+    # 清洗空值 (非常重要)
+    df = df.dropna(subset=[target_col])
+
+    # 特征工程 (保持你的公式)
+    df['Reaction_Intensity'] = df['PS'] * df['KOH']
+    df['Dosage_Ratio'] = df['PS'] / (df['KOH'] + 0.01)
+
+    if 'R1' in df.columns:
+        df['Degradation_Potential'] = (df['R1'] + df['R2']) / (df['R5'] + 0.01)
+        # R5 或者 R5o，根据表格实际情况
+        r5_col = 'R5'
+    elif 'R1o' in df.columns:
+        df['Degradation_Potential'] = (df['R1o'] + df['R2o']) / (df['R5o'] + 0.01)
+        r5_col = 'R5o'
+    else:
+        print("❌ 找不到 R1 或 R1o 列")
+        exit()
+
+    features = ['PS', 'KOH', 'Reaction_Intensity', 'Dosage_Ratio', 'Degradation_Potential', r5_col]
+
+    X = df[features].values
+    y = df[target_col].values
+
+except Exception as e:
+    print(f"❌ 数据处理错误: {e}")
+    exit()
+
+# 数据切分 (固定种子)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=BEST_SEED)
+
+# 标准化 (fit on train)
+scaler = StandardScaler()
+X_train_s = scaler.fit_transform(X_train)
+X_test_s = scaler.transform(X_test)
+
+print(f"✅ 数据准备完毕。特征: {features}")
+
+
+# ====================== 2. 定义调参目标函数 ======================
+def objective(trial, model_name):
+    # --- 1. Ridge (岭回归) ---
+    if model_name == "Ridge":
+        param = {
+            'alpha': trial.suggest_float('alpha', 0.01, 50, log=True)
+        }
+        model = Ridge(**param)
+
+    # --- 2. KNN (K近邻) ---
+    elif model_name == "KNN":
+        param = {
+            'n_neighbors': trial.suggest_int('n_neighbors', 2, 15),
+            'weights': trial.suggest_categorical('weights', ['uniform', 'distance']),
+            'p': trial.suggest_categorical('p', [1, 2])
+        }
+        model = KNeighborsRegressor(**param)
+
+    # --- 3. SVR (支持向量机) ---
+    elif model_name == "SVR":
+        param = {
+            'C': trial.suggest_float('C', 0.1, 1000, log=True),  # 范围加大，因为y没有归一化
+            'epsilon': trial.suggest_float('epsilon', 0.01, 2.0),
+            'kernel': trial.suggest_categorical('kernel', ['linear', 'rbf'])
+        }
+        model = SVR(**param)
+
+    # --- 4. DecisionTree (决策树) ---
+    elif model_name == "DecisionTree":
+        param = {
+            'max_depth': trial.suggest_int('max_depth', 2, 10),
+            'min_samples_split': trial.suggest_int('min_samples_split', 2, 20),
+            'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 10),
+            'random_state': BEST_SEED
+        }
+        model = DecisionTreeRegressor(**param)
+
+    # --- 5. RandomForest (随机森林) ---
+    elif model_name == "RandomForest":
+        param = {
+            'n_estimators': trial.suggest_int('n_estimators', 50, 500),
+            'max_depth': trial.suggest_int('max_depth', 3, 12),
+            'min_samples_split': trial.suggest_int('min_samples_split', 2, 15),
+            'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 5),
+            'random_state': BEST_SEED,
+            'n_jobs': 1
+        }
+        model = RandomForestRegressor(**param)
+
+    # --- 6. GradientBoosting (梯度提升树) ---
+    elif model_name == "GradientBoosting":
+        param = {
+            'n_estimators': trial.suggest_int('n_estimators', 50, 500),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+            'max_depth': trial.suggest_int('max_depth', 2, 8),
+            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'random_state': BEST_SEED
+        }
+        model = GradientBoostingRegressor(**param)
+
+    # --- 7. XGBoost ---
+    elif model_name == "XGBoost":
+        param = {
+            'n_estimators': trial.suggest_int('n_estimators', 50, 500),
+            'max_depth': trial.suggest_int('max_depth', 2, 8),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'reg_alpha': trial.suggest_float('reg_alpha', 0, 10),
+            'reg_lambda': trial.suggest_float('reg_lambda', 0, 10),
+            'n_jobs': 1,
+            'random_state': BEST_SEED
+        }
+        model = xgb.XGBRegressor(**param)
+
+    # 核心考核指标：CV R2 (5折交叉验证)
+    # 我们优化的是 CV 分数，而不是 Test 分数，这样更严谨
+    cv_scores = cross_val_score(model, X_train_s, y_train, cv=5, scoring='r2')
+    return cv_scores.mean()
+
+
+# ====================== 3. 开始全模型特训 ======================
+models_list = ["Ridge", "KNN", "SVR", "DecisionTree", "RandomForest", "GradientBoosting", "XGBoost"]
+results_data = []
+
+print("\n" + "=" * 60)
+print(f"🏆 开始 7 大模型自动寻优 (Seed={BEST_SEED})")
+print("=" * 60)
+
+for name in models_list:
+    print(f"💪 正在优化 {name} ... ", end="")
+
+    # 创建优化任务
+    study = optuna.create_study(direction='maximize')
+    # n_trials=50 表示每个模型尝试 50 种参数组合
+    study.optimize(lambda trial: objective(trial, name), n_trials=50)
+
+    # 获取最佳参数和分数
+    best_cv = study.best_value
+    best_params = study.best_params
+
+    # 打印进度
+    print(f"最佳 CV R2: {best_cv:.4f}")
+
+    # --- 用最佳参数做最后一次评估 ---
+    # 重新实例化模型
+    if name == "Ridge":
+        model = Ridge(**best_params)
+    elif name == "KNN":
+        model = KNeighborsRegressor(**best_params)
+    elif name == "SVR":
+        model = SVR(**best_params)
+    elif name == "DecisionTree":
+        model = DecisionTreeRegressor(**best_params, random_state=BEST_SEED)
+    elif name == "RandomForest":
+        model = RandomForestRegressor(**best_params, random_state=BEST_SEED, n_jobs=1)
+    elif name == "GradientBoosting":
+        model = GradientBoostingRegressor(**best_params, random_state=BEST_SEED)
+    elif name == "XGBoost":
+        model = xgb.XGBRegressor(**best_params, random_state=BEST_SEED, n_jobs=1)
+
+    # 训练
+    model.fit(X_train_s, y_train)
+
+    # 计算最终指标
+    train_r2 = model.score(X_train_s, y_train)
+    test_r2 = model.score(X_test_s, y_test)
+
+    results_data.append({
+        "Model": name,
+        "Best_CV_R2": best_cv,
+        "Test_R2": test_r2,
+        "Train_R2": train_r2,
+        "Best_Params": str(best_params)  # 转字符串方便保存
+    })
+
+# ====================== 4. 结果汇总与输出 ======================
+results_df = pd.DataFrame(results_data).sort_values(by="Best_CV_R2", ascending=False)
+
+print("\n" + "=" * 80)
+print("🏅 最终排行榜 (按 CV R2 硬实力排序)")
+print("=" * 80)
+print(results_df[["Model", "Best_CV_R2", "Test_R2", "Train_R2"]].to_string(index=False))
+
+# 保存到 CSV
+save_path = os.path.join(SAVE_FOLDER, "optuna_optimization_results.csv")
+results_df.to_csv(save_path, index=False, encoding='utf-8-sig')
+print(f"\n📁 详细结果已保存至: {save_path}")
+
+# 输出冠军参数
+champion = results_df.iloc[0]
+print("\n" + "=" * 80)
+print(f"🎉 你的最强模型是: {champion['Model']}")
+print("👇 请复制以下参数用于论文绘图/最终预测：")
+print(champion['Best_Params'])
+print("=" * 80)

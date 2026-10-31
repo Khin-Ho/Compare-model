@@ -1,0 +1,135 @@
+import os
+import pandas as pd
+import numpy as np
+import shap
+import matplotlib
+import matplotlib.pyplot as plt
+from sklearn.ensemble import GradientBoostingRegressor # <--- 换成冠军库
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+import warnings
+
+# ====================== 0. 基础设置 ======================
+matplotlib.use('Agg')
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+warnings.filterwarnings('ignore')
+
+DATA_PATH = r"E:\桌面\Milk\积分milk.xlsx"
+SAVE_FOLDER = r"E:\桌面\Milk\Final_Champion_GBR"
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+SEED = 1830 # 冠军种子
+
+# ====================== 1. 准备数据 ======================
+print("正在准备数据...")
+df = pd.read_excel(DATA_PATH)
+df = df.rename(columns={'PS(%)': 'PS', 'KOH(%)': 'KOH', 'PS（%）': 'PS', 'KOH（%）': 'KOH'})
+
+# 自动找 HIX
+target_col = 'HIX_normalized' if 'HIX_normalized' in df.columns else 'HIX'
+df = df.dropna(subset=[target_col])
+
+# 特征工程
+df['Reaction_Intensity'] = df['PS'] * df['KOH']
+df['Dosage_Ratio'] = df['PS'] / (df['KOH'] + 0.01)
+if 'R1' in df.columns:
+    df['Degradation_Potential'] = (df['R1'] + df['R2']) / (df['R5'] + 0.01)
+    features = ['PS', 'KOH', 'Reaction_Intensity', 'Dosage_Ratio', 'Degradation_Potential', 'R5']
+else:
+    df['Degradation_Potential'] = (df['R1o'] + df['R2o']) / (df['R5o'] + 0.01)
+    features = ['PS', 'KOH', 'Reaction_Intensity', 'Dosage_Ratio', 'Degradation_Potential', 'R5o']
+
+X = df[features].values
+y = df[target_col].values
+
+# 标准化
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=SEED)
+scaler = StandardScaler()
+X_train_s = scaler.fit_transform(X_train)
+# 全数据标准化用于画图
+X_s = scaler.transform(X)
+X_df = pd.DataFrame(X_s, columns=features)
+
+# ====================== 2. 定义冠军模型 (GradientBoosting) ======================
+# 👇 这里填入刚才跑出来的最优参数
+best_params = {
+    'n_estimators': 385,
+    'learning_rate': 0.01057,
+    'max_depth': 2,
+    'subsample': 0.749,
+    'random_state': SEED
+}
+
+print(f"正在训练冠军模型 (GradientBoosting)...")
+model = GradientBoostingRegressor(**best_params)
+model.fit(X_train_s, y_train)
+
+# 验证一下分数
+print(f"最终确认 -> Train R2: {model.score(X_train_s, y_train):.3f}")
+# 注意：这里要用 scaler.transform 处理测试集
+X_test_s = scaler.transform(X_test)
+print(f"最终确认 -> Test R2:  {model.score(X_test_s, y_test):.3f}")
+
+# ====================== 3. SHAP 机理分析 ======================
+print("正在进行 SHAP 分析...")
+plt.figure(figsize=(10, 6))
+
+# GradientBoosting 也是树模型，可以用 TreeExplainer
+explainer = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(X_df)
+
+shap.summary_plot(shap_values, X_df, show=False)
+plt.title(f"SHAP Analysis (GradientBoosting, R2={model.score(X_test_s, y_test):.2f})", fontsize=14)
+plt.tight_layout()
+plt.savefig(os.path.join(SAVE_FOLDER, 'SHAP_Summary_GBR.png'), dpi=300)
+print(f"✅ SHAP图已保存")
+plt.close()
+
+# ====================== 4. 寻优热力图 (Heatmap) ======================
+print("正在绘制热力图...")
+# 获取基底数据的平均值
+avg_vals = df[features].mean()
+
+# 生成网格
+ps_range = np.linspace(0, 30, 100) # 根据你的PS范围调整，比如 0-30
+koh_range = np.linspace(0, 15, 100) # 根据你的KOH范围调整，比如 0-15
+grid_data = []
+
+for ps in ps_range:
+    for koh in koh_range:
+        # 动态计算衍生特征
+        reaction = ps * koh
+        ratio = ps / (koh + 0.01)
+        # 其他特征固定为平均值
+        row = [ps, koh, reaction, ratio, avg_vals['Degradation_Potential'], avg_vals[features[-1]]]
+        grid_data.append(row)
+
+X_grid = pd.DataFrame(grid_data, columns=features)
+X_grid_scaled = scaler.transform(X_grid.values)
+
+# 预测
+X_grid['Predicted_HIX'] = model.predict(X_grid_scaled)
+
+# 绘图
+pivot_table = X_grid.pivot(index='KOH', columns='PS', values='Predicted_HIX')
+plt.figure(figsize=(10, 8))
+contour = plt.contourf(pivot_table.columns, pivot_table.index, pivot_table.values,
+                       levels=20, cmap='viridis')
+plt.colorbar(contour, label='Predicted HIX')
+
+# 找最大值
+best_recipe = X_grid.sort_values(by='Predicted_HIX', ascending=False).iloc[0]
+plt.scatter(best_recipe['PS'], best_recipe['KOH'], color='red', marker='*', s=200, edgecolors='white', label='Optimal')
+plt.text(best_recipe['PS']-5, best_recipe['KOH']+0.5,
+         f"Max HIX={best_recipe['Predicted_HIX']:.2f}\nPS={best_recipe['PS']:.1f}, KOH={best_recipe['KOH']:.1f}",
+         color='white', fontweight='bold', bbox=dict(facecolor='black', alpha=0.6))
+
+plt.title('Optimal Dosage Strategy (GradientBoosting)', fontsize=15)
+plt.xlabel('PS Dosage (%)', fontsize=12)
+plt.ylabel('KOH Dosage (%)', fontsize=12)
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(SAVE_FOLDER, 'Optimization_Heatmap_GBR.png'), dpi=300)
+print(f"✅ 热力图已保存")
+
+print(f"\n全部完成！请去文件夹 {SAVE_FOLDER} 查看最终成果。")

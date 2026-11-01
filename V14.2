@@ -1,0 +1,197 @@
+import os
+import pandas as pd
+import numpy as np
+import shap
+import matplotlib
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.inspection import PartialDependenceDisplay
+
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error
+import warnings
+
+# ====================== 0. 基础设置 ======================
+# 防止绘图卡死
+matplotlib.use('Agg')
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']  # 适配中文
+plt.rcParams['axes.unicode_minus'] = False
+warnings.filterwarnings('ignore')
+
+# 路径设置
+DATA_PATH = r"E:\桌面\Milk\数据库-积分强度.xlsx"
+SAVE_FOLDER = r"E:\桌面\Milk\All_Models_Analysis"
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# 冠军种子
+SEED = 1830
+
+# ====================== 1. 数据准备 (标准流程) ======================
+print("🔄 正在准备数据...")
+try:
+    df = pd.read_excel(DATA_PATH)
+    rename_dict = {'PS(%)': 'PS', 'KOH(%)': 'KOH', 'PS（%）': 'PS', 'KOH（%）': 'KOH'}
+    df = df.rename(columns=rename_dict)
+
+    target_col = 'HIX_normalized' if 'HIX_normalized' in df.columns else 'HIX'
+    df = df.dropna(subset=[target_col])
+
+    # 特征工程
+    df['Reaction_Intensity'] = df['PS'] * df['KOH']
+    df['Dosage_Ratio'] = df['PS'] / (df['KOH'] + 0.01)
+
+    if 'R1' in df.columns:
+        df['Degradation_Potential'] = (df['R1'] + df['R2']) / (df['R5'] + 0.01)
+        r5_col = 'R5'
+    else:
+        df['Degradation_Potential'] = (df['R1o'] + df['R2o']) / (df['R5o'] + 0.01)
+        r5_col = 'R5o'
+
+    features = ['PS', 'KOH', 'Reaction_Intensity', 'Dosage_Ratio', 'Degradation_Potential', r5_col]
+
+    X = df[features].values
+    y = df[target_col].values
+
+    # 切分与标准化
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=SEED)
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
+
+    # 创建 DataFrame 方便 SHAP 绘图
+    X_train_df = pd.DataFrame(X_train_s, columns=features)
+    X_test_df = pd.DataFrame(X_test_s, columns=features)
+
+except Exception as e:
+    print(f"❌ 数据读取错误: {e}")
+    exit()
+
+# ====================== 2. 定义所有模型 (移到打印之前) ======================
+# ★★★ 冠军参数 (GradientBoosting) ★★★
+gbr_best_params = {
+    'n_estimators': 385, 'learning_rate': 0.01057,
+    'max_depth': 2, 'subsample': 0.749, 'random_state': SEED
+}
+
+models_dict = {
+    "Ridge": Ridge(),
+    "KNN": KNeighborsRegressor(n_neighbors=5),
+    "SVR": SVR(C=10, kernel='rbf'),
+    "DecisionTree": DecisionTreeRegressor(max_depth=5, random_state=SEED),
+    "RandomForest": RandomForestRegressor(n_estimators=150, max_depth=6, random_state=SEED),
+    "GradientBoosting": GradientBoostingRegressor(**gbr_best_params),  # 👑 冠军配置
+    "XGBoost": xgb.XGBRegressor(n_estimators=100, max_depth=3, learning_rate=0.1, n_jobs=1, random_state=SEED)
+}
+
+print(f"✅ 数据准备完毕。分析对象: {len(models_dict)} 个模型")
+
+# ====================== 3. 循环绘图引擎 ======================
+for name, model in models_dict.items():
+    print(f"\n🎨 正在为 {name} 生成全套图表...")
+
+    try:
+        # --- A. 训练 ---
+        model.fit(X_train_s, y_train)
+        y_pred = model.predict(X_test_s)
+        r2 = r2_score(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+
+        # 创建该模型的专属文件夹
+        model_folder = os.path.join(SAVE_FOLDER, name)
+        os.makedirs(model_folder, exist_ok=True)
+
+        # -------------------------------------------------------
+        # 📊 图1：实测值 vs 预测值 (Scatter Plot)
+        # -------------------------------------------------------
+        plt.figure(figsize=(8, 8))
+        plt.scatter(y_test, y_pred, color='#3B82F6', alpha=0.7, s=80, edgecolors='k', label='Test Data')
+
+        # 画对角线
+        min_val = min(y_test.min(), y_pred.min())
+        max_val = max(y_test.max(), y_pred.max())
+        plt.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Perfect Prediction')
+
+        plt.title(f'{name}: Actual vs Predicted\nR2={r2:.3f}, RMSE={rmse:.3f}', fontsize=16)
+        plt.xlabel('Actual HIX', fontsize=14)
+        plt.ylabel('Predicted HIX', fontsize=14)
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.5)
+
+        plt.savefig(os.path.join(model_folder, '1_Scatter_Plot.png'), dpi=300)
+        plt.close()
+
+        # -------------------------------------------------------
+        # 🧠 图2：SHAP 摘要图 (SHAP Summary Plot)
+        # -------------------------------------------------------
+        print(f"   -> 计算 SHAP 值 (可能稍慢)...")
+        try:
+            plt.figure()  # 新建画布
+
+            # 1. 树模型 (XGB, RF, DT, GBR)
+            if name in ["XGBoost", "RandomForest", "DecisionTree", "GradientBoosting"]:
+                explainer = shap.TreeExplainer(model)
+                shap_values = explainer.shap_values(X_test_df)
+
+            # 2. 线性模型 (Ridge)
+            elif name == "Ridge":
+                explainer = shap.LinearExplainer(model, X_train_df)
+                shap_values = explainer.shap_values(X_test_df)
+
+            # 3. 核模型 (SVR, KNN) - 速度慢，需要降采样背景
+            else:
+                # 使用 K-means 聚类出 10 个代表性背景点，加速计算
+                background = shap.kmeans(X_train_df, 10)
+                explainer = shap.KernelExplainer(model.predict, background)
+                shap_values = explainer.shap_values(X_test_df, nsamples=50)  # 采样限制
+
+            # 绘制 Summary Plot
+            shap.summary_plot(shap_values, X_test_df, show=False)
+            plt.title(f'{name} SHAP Feature Importance', fontsize=14)
+            plt.tight_layout()
+            plt.savefig(os.path.join(model_folder, '2_SHAP_Summary.png'), dpi=300, bbox_inches='tight')
+            plt.close()
+
+        except Exception as e:
+            print(f"   ⚠️ SHAP 生成失败: {e}")
+
+        # -------------------------------------------------------
+        # 📈 图3：部分依赖图 (PDP - Interaction)
+        # -------------------------------------------------------
+        print(f"   -> 计算 PDP 交互图 (PS vs KOH)...")
+        try:
+            fig, ax = plt.subplots(figsize=(10, 8))
+
+            # 我们只看最核心的两个变量：PS (索引0) 和 KOH (索引1)
+            display = PartialDependenceDisplay.from_estimator(
+                model,
+                X_train_s,
+                features=[(0, 1)],  # (PS, KOH) 的组合
+                feature_names=features,
+                kind='average',
+                ax=ax,
+                cmap='viridis'
+            )
+
+            plt.title(f'{name} PDP: Interaction of PS & KOH', fontsize=16)
+            plt.savefig(os.path.join(model_folder, '3_PDP_Interaction.png'), dpi=300)
+            plt.close()
+
+        except Exception as e:
+            print(f"   ⚠️ PDP 生成失败: {e}")
+
+        print(f"   ✅ {name} 完成！")
+
+    except Exception as main_e:
+        print(f"   ❌ {name} 训练或绘图严重错误: {main_e}")
+
+print("\n" + "=" * 60)
+print(f"🎉 全部完成！所有图表已保存至: {SAVE_FOLDER}")
+print("每个模型都有一个独立的文件夹，里面有 3 张图。")
+print("=" * 60)

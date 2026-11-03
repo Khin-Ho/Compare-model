@@ -1,0 +1,419 @@
+import os
+import tempfile
+import joblib as jl
+import numpy as np
+import pandas as pd
+import optuna
+
+from sklearn.model_selection import train_test_split, cross_val_score, KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+
+from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor
+import xgboost as xgb
+
+# 如果你安装了 catboost，就会自动加入
+try:
+    from catboost import CatBoostRegressor
+    CATBOOST_AVAILABLE = True
+except:
+    CATBOOST_AVAILABLE = False
+
+
+# ==============================
+# 0. 临时文件夹修正（防止报错）
+# ==============================
+tempfile.tempdir = r"C:\Temp"
+os.makedirs(tempfile.tempdir, exist_ok=True)
+
+
+# ==============================
+# 1. 路径
+# ==============================
+DATA_PATH = r"E:\桌面\Milk\数据库-积分强度.xlsx"
+SAVE_FOLDER = r"E:\桌面\Milk\数据库-积分强度_OPTUNA_V15"
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+
+# ==============================
+# 2. 读取数据
+# ==============================
+df = pd.read_excel(DATA_PATH)
+df = df.rename(columns={'PS(%)': 'PS', 'KOH(%)': 'KOH'})
+
+
+# ==============================
+# 3. 基础清洗（去掉空值）
+# ==============================
+df = df.dropna(subset=['HIX', 'PS', 'KOH', 'R1o', 'R2o', 'R3o', 'R4o', 'R5o'])
+df = df.reset_index(drop=True)
+
+
+# ==============================
+# 4. 核心特征工程（科研级提升点）
+# ==============================
+eps = 1e-8
+
+# 基础和总强度
+df["R_total"] = df["R1o"] + df["R2o"] + df["R3o"] + df["R4o"] + df["R5o"]
+
+# 区域占比（超级重要）
+for r in ["R1o", "R2o", "R3o", "R4o", "R5o"]:
+    df[f"{r}_ratio"] = df[r] / (df["R_total"] + eps)
+
+# Humic-like vs Protein-like 组合
+df["Humic_like"] = df["R3o"] + df["R5o"]
+df["Protein_like"] = df["R1o"] + df["R2o"]
+df["Fulvic_like"] = df["R4o"]
+
+df["Humic_Protein_Ratio"] = df["Humic_like"] / (df["Protein_like"] + eps)
+df["Humic_Total_Ratio"] = df["Humic_like"] / (df["R_total"] + eps)
+df["Protein_Total_Ratio"] = df["Protein_like"] / (df["R_total"] + eps)
+
+# 区域比值特征（反映腐殖化方向）
+df["R5_R1"] = df["R5o"] / (df["R1o"] + eps)
+df["R3_R2"] = df["R3o"] / (df["R2o"] + eps)
+df["R5_R2"] = df["R5o"] / (df["R2o"] + eps)
+df["R3_R1"] = df["R3o"] / (df["R1o"] + eps)
+df["R4_R1"] = df["R4o"] / (df["R1o"] + eps)
+
+# 反应相关特征（你原来的思路保留）
+df["Reaction_Intensity"] = df["PS"] * df["KOH"]
+df["Dosage_Ratio"] = df["KOH"] / (df["PS"] + eps)
+
+# 反应强度平方项（增强非线性）
+df["Reaction_Intensity_sq"] = df["Reaction_Intensity"] ** 2
+
+# log特征（让模型更容易拟合比例型非线性）
+df["log_PS"] = np.log1p(df["PS"])
+df["log_KOH"] = np.log1p(df["KOH"])
+df["log_R_total"] = np.log1p(df["R_total"])
+df["log_Humic_like"] = np.log1p(df["Humic_like"])
+df["log_Protein_like"] = np.log1p(df["Protein_like"])
+
+
+# ==============================
+# 5. X, y
+# ==============================
+features = [
+    "PS", "KOH",
+    "Reaction_Intensity", "Reaction_Intensity_sq",
+    "Dosage_Ratio",
+
+    "R1o", "R2o", "R3o", "R4o", "R5o",
+    "R_total",
+
+    "R1o_ratio", "R2o_ratio", "R3o_ratio", "R4o_ratio", "R5o_ratio",
+
+    "Humic_like", "Protein_like", "Fulvic_like",
+    "Humic_Protein_Ratio", "Humic_Total_Ratio", "Protein_Total_Ratio",
+
+    "R5_R1", "R3_R2", "R5_R2", "R3_R1", "R4_R1",
+
+    "log_PS", "log_KOH",
+    "log_R_total", "log_Humic_like", "log_Protein_like"
+]
+
+X = df[features].values
+y_raw = df["HIX"].values
+
+
+# ==============================
+# 6. train-test split
+# ==============================
+X_train, X_test, y_train_raw, y_test_raw = train_test_split(
+    X, y_raw, test_size=0.2, random_state=28
+)
+
+
+# ==============================
+# 7. 标准化（对SVR特别重要）
+# ==============================
+scaler_X = StandardScaler()
+X_train_scaled = scaler_X.fit_transform(X_train)
+X_test_scaled = scaler_X.transform(X_test)
+
+jl.dump(scaler_X, os.path.join(SAVE_FOLDER, "scaler_X.pkl"))
+
+
+# ==============================
+# 8. CV策略
+# ==============================
+cv = KFold(n_splits=5, shuffle=True, random_state=28)
+
+
+# ==============================
+# 9. 定义评估函数
+# ==============================
+def evaluate_model(model, Xtr, Xte, ytr, yte):
+    pred_train = model.predict(Xtr)
+    pred_test = model.predict(Xte)
+
+    train_r2 = r2_score(ytr, pred_train)
+    test_r2 = r2_score(yte, pred_test)
+
+    mae = mean_absolute_error(yte, pred_test)
+    rmse = np.sqrt(mean_squared_error(yte, pred_test))
+
+    return train_r2, test_r2, mae, rmse
+
+
+# ==============================
+# 10. Optuna调参函数
+# ==============================
+def tune_svr(trials=120, use_logy=True):
+    print(f"\n==============================")
+    print(f" Optuna Tuning SVR ({trials} trials)")
+    print(f"==============================")
+
+    if use_logy:
+        y_train = np.log1p(y_train_raw)
+        y_test = np.log1p(y_test_raw)
+    else:
+        y_train = y_train_raw
+        y_test = y_test_raw
+
+    def objective(trial):
+        C = trial.suggest_float("C", 0.01, 200, log=True)
+        epsilon = trial.suggest_float("epsilon", 0.001, 0.5)
+        gamma = trial.suggest_float("gamma", 1e-4, 2.0, log=True)
+
+        model = SVR(kernel="rbf", C=C, epsilon=epsilon, gamma=gamma)
+
+        scores = cross_val_score(model, X_train_scaled, y_train, cv=cv, scoring="r2", n_jobs=1)
+        return scores.mean()
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=trials, show_progress_bar=False)
+
+    best_params = study.best_params
+    best_model = SVR(kernel="rbf", **best_params)
+    best_model.fit(X_train_scaled, y_train)
+
+    train_r2, test_r2, mae, rmse = evaluate_model(best_model, X_train_scaled, X_test_scaled, y_train, y_test)
+
+    # 如果logy，输出真实尺度R2
+    if use_logy:
+        pred_test_real = np.expm1(best_model.predict(X_test_scaled))
+        pred_train_real = np.expm1(best_model.predict(X_train_scaled))
+        train_r2 = r2_score(y_train_raw, pred_train_real)
+        test_r2 = r2_score(y_test_raw, pred_test_real)
+        mae = mean_absolute_error(y_test_raw, pred_test_real)
+        rmse = np.sqrt(mean_squared_error(y_test_raw, pred_test_real))
+
+    print("\nBest SVR Params:", best_params)
+    print(f"SVR | Train R2: {train_r2:.3f}, Test R2: {test_r2:.3f}, MAE: {mae:.4f}, RMSE: {rmse:.4f}")
+
+    jl.dump(best_model, os.path.join(SAVE_FOLDER, "SVR_best.pkl"))
+
+    return ("SVR", train_r2, test_r2, mae, rmse)
+
+
+def tune_rf(trials=120, use_logy=True):
+    print(f"\n==============================")
+    print(f" Optuna Tuning RandomForest ({trials} trials)")
+    print(f"==============================")
+
+    if use_logy:
+        y_train = np.log1p(y_train_raw)
+        y_test = np.log1p(y_test_raw)
+    else:
+        y_train = y_train_raw
+        y_test = y_test_raw
+
+    def objective(trial):
+        n_estimators = trial.suggest_int("n_estimators", 200, 2000)
+        max_depth = trial.suggest_int("max_depth", 3, 25)
+        min_samples_split = trial.suggest_int("min_samples_split", 2, 20)
+        min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 10)
+        max_features = trial.suggest_float("max_features", 0.3, 1.0)
+
+        model = RandomForestRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            min_samples_split=min_samples_split,
+            min_samples_leaf=min_samples_leaf,
+            max_features=max_features,
+            random_state=28,
+            n_jobs=1
+        )
+
+        scores = cross_val_score(model, X_train, y_train, cv=cv, scoring="r2", n_jobs=1)
+        return scores.mean()
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=trials, show_progress_bar=False)
+
+    best_params = study.best_params
+    best_model = RandomForestRegressor(**best_params, random_state=28, n_jobs=1)
+    best_model.fit(X_train, y_train)
+
+    train_r2, test_r2, mae, rmse = evaluate_model(best_model, X_train, X_test, y_train, y_test)
+
+    if use_logy:
+        pred_test_real = np.expm1(best_model.predict(X_test))
+        pred_train_real = np.expm1(best_model.predict(X_train))
+        train_r2 = r2_score(y_train_raw, pred_train_real)
+        test_r2 = r2_score(y_test_raw, pred_test_real)
+        mae = mean_absolute_error(y_test_raw, pred_test_real)
+        rmse = np.sqrt(mean_squared_error(y_test_raw, pred_test_real))
+
+    print("\nBest RF Params:", best_params)
+    print(f"RF | Train R2: {train_r2:.3f}, Test R2: {test_r2:.3f}, MAE: {mae:.4f}, RMSE: {rmse:.4f}")
+
+    jl.dump(best_model, os.path.join(SAVE_FOLDER, "RF_best.pkl"))
+
+    return ("RandomForest", train_r2, test_r2, mae, rmse)
+
+
+def tune_xgb(trials=150, use_logy=True):
+    print(f"\n==============================")
+    print(f" Optuna Tuning XGBoost ({trials} trials)")
+    print(f"==============================")
+
+    if use_logy:
+        y_train = np.log1p(y_train_raw)
+        y_test = np.log1p(y_test_raw)
+    else:
+        y_train = y_train_raw
+        y_test = y_test_raw
+
+    def objective(trial):
+        params = {
+            "n_estimators": trial.suggest_int("n_estimators", 200, 2500),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "max_depth": trial.suggest_int("max_depth", 2, 12),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 15),
+            "gamma": trial.suggest_float("gamma", 0.0, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 20.0, log=True),
+        }
+
+        model = xgb.XGBRegressor(
+            **params,
+            random_state=28,
+            n_jobs=1,
+            tree_method="hist"
+        )
+
+        scores = cross_val_score(model, X_train, y_train, cv=cv, scoring="r2", n_jobs=1)
+        return scores.mean()
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=trials, show_progress_bar=False)
+
+    best_params = study.best_params
+    best_model = xgb.XGBRegressor(
+        **best_params,
+        random_state=28,
+        n_jobs=1,
+        tree_method="hist"
+    )
+    best_model.fit(X_train, y_train)
+
+    train_r2, test_r2, mae, rmse = evaluate_model(best_model, X_train, X_test, y_train, y_test)
+
+    if use_logy:
+        pred_test_real = np.expm1(best_model.predict(X_test))
+        pred_train_real = np.expm1(best_model.predict(X_train))
+        train_r2 = r2_score(y_train_raw, pred_train_real)
+        test_r2 = r2_score(y_test_raw, pred_test_real)
+        mae = mean_absolute_error(y_test_raw, pred_test_real)
+        rmse = np.sqrt(mean_squared_error(y_test_raw, pred_test_real))
+
+    print("\nBest XGB Params:", best_params)
+    print(f"XGB | Train R2: {train_r2:.3f}, Test R2: {test_r2:.3f}, MAE: {mae:.4f}, RMSE: {rmse:.4f}")
+
+    jl.dump(best_model, os.path.join(SAVE_FOLDER, "XGB_best.pkl"))
+
+    return ("XGBoost", train_r2, test_r2, mae, rmse)
+
+
+def tune_catboost(trials=150, use_logy=True):
+    if not CATBOOST_AVAILABLE:
+        return None
+
+    print(f"\n==============================")
+    print(f" Optuna Tuning CatBoost ({trials} trials)")
+    print(f"==============================")
+
+    if use_logy:
+        y_train = np.log1p(y_train_raw)
+        y_test = np.log1p(y_test_raw)
+    else:
+        y_train = y_train_raw
+        y_test = y_test_raw
+
+    def objective(trial):
+        params = {
+            "iterations": trial.suggest_int("iterations", 500, 4000),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "depth": trial.suggest_int("depth", 3, 12),
+            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-3, 50.0, log=True),
+            "random_strength": trial.suggest_float("random_strength", 1e-3, 10.0, log=True),
+            "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 1.0),
+        }
+
+        model = CatBoostRegressor(
+            **params,
+            random_state=28,
+            verbose=0
+        )
+
+        scores = cross_val_score(model, X_train, y_train, cv=cv, scoring="r2", n_jobs=1)
+        return scores.mean()
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=trials, show_progress_bar=False)
+
+    best_params = study.best_params
+    best_model = CatBoostRegressor(**best_params, random_state=28, verbose=0)
+    best_model.fit(X_train, y_train)
+
+    train_r2, test_r2, mae, rmse = evaluate_model(best_model, X_train, X_test, y_train, y_test)
+
+    if use_logy:
+        pred_test_real = np.expm1(best_model.predict(X_test))
+        pred_train_real = np.expm1(best_model.predict(X_train))
+        train_r2 = r2_score(y_train_raw, pred_train_real)
+        test_r2 = r2_score(y_test_raw, pred_test_real)
+        mae = mean_absolute_error(y_test_raw, pred_test_real)
+        rmse = np.sqrt(mean_squared_error(y_test_raw, pred_test_real))
+
+    print("\nBest CatBoost Params:", best_params)
+    print(f"CatBoost | Train R2: {train_r2:.3f}, Test R2: {test_r2:.3f}, MAE: {mae:.4f}, RMSE: {rmse:.4f}")
+
+    jl.dump(best_model, os.path.join(SAVE_FOLDER, "CatBoost_best.pkl"))
+
+    return ("CatBoost", train_r2, test_r2, mae, rmse)
+
+
+# ==============================
+# 11. 开始训练（logy=True 推荐）
+# ==============================
+results = []
+
+results.append(tune_svr(trials=120, use_logy=True))
+results.append(tune_rf(trials=120, use_logy=True))
+results.append(tune_xgb(trials=150, use_logy=True))
+
+cat_res = tune_catboost(trials=150, use_logy=True)
+if cat_res is not None:
+    results.append(cat_res)
+
+
+# ==============================
+# 12. 保存结果
+# ==============================
+results_df = pd.DataFrame(results, columns=["Model", "Train_R2", "Test_R2", "MAE", "RMSE"])
+results_df = results_df.sort_values("Test_R2", ascending=False)
+
+results_df.to_csv(os.path.join(SAVE_FOLDER, "optuna_final_results.csv"), index=False)
+results_df.to_excel(os.path.join(SAVE_FOLDER, "optuna_final_results.xlsx"), index=False)
+
+print("\n================ FINAL RESULTS ================")
+print(results_df)
+print(f"\nSaved models + results to: {SAVE_FOLDER}")

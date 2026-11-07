@@ -1,0 +1,92 @@
+import os
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+import xgboost as xgb
+import shap
+import matplotlib.pyplot as plt
+
+# ====================== 路径 ======================
+DATA_PATH = r"E:\桌面\Milk\积分milk.xlsx"  # 你的 Excel 路径
+SAVE_FOLDER = r"E:\桌面\Milk\Feature_Contribution"
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# ====================== 1. 读取数据 ======================
+df = pd.read_excel(DATA_PATH)
+df = df.rename(columns={'PS(%)': 'PS', 'KOH(%)': 'KOH'})
+df = df.dropna(subset=['HIX'])  # 确保 HIX 有值
+
+# ====================== 2. 衍生特征 ======================
+df['Reaction_Intensity'] = df['PS'] * df['KOH']
+df['Dosage_Ratio'] = df['PS'] / (df['KOH'] + 0.01)
+df['Degradation_Potential'] = (df['R1o'] + df['R2o']) / (df['R5o'] + 0.01)
+
+# 新增组合特征
+df['R1o_R2o'] = df['R1o'] / (df['R2o'] + 0.01)
+df['R3o_R4o'] = df['R3o'] / (df['R4o'] + 0.01)
+df['Total_Fluorescence'] = df[['R1o','R2o','R3o','R4o','R5o']].sum(axis=1)
+df['PS_R1o'] = df['PS'] * df['R1o']
+df['KOH_R5o'] = df['KOH'] * df['R5o']
+
+# ====================== 3. 特征和目标 ======================
+features = [
+    'PS', 'KOH', 'Reaction_Intensity', 'Dosage_Ratio', 'Degradation_Potential',
+    'R5o', 'R1o_R2o', 'R3o_R4o', 'Total_Fluorescence', 'PS_R1o', 'KOH_R5o'
+]
+X = df[features].values
+y = df['HIX'].values
+
+# ====================== 4. 划分训练集和测试集 ======================
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=888
+)
+
+# 标准化（树模型不敏感，但 SHAP 分析更稳定）
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# ====================== 5. 模型选择 ======================
+models = {
+    'RandomForest': RandomForestRegressor(n_estimators=200, max_depth=6, random_state=888),
+    'GradientBoosting': GradientBoostingRegressor(n_estimators=200, learning_rate=0.03, max_depth=3, random_state=888),
+    'XGBoost': xgb.XGBRegressor(n_estimators=200, learning_rate=0.03, max_depth=3, random_state=888)
+}
+
+# ====================== 6. 训练 + SHAP 分析 ======================
+for name, model in models.items():
+    print(f"\nTraining {name} ...")
+    model.fit(X_train_scaled, y_train)
+
+    # 预测检查
+    y_pred = model.predict(X_test_scaled)
+    r2 = model.score(X_test_scaled, y_test)
+    print(f"{name} Test R2: {r2:.3f}")
+
+    # SHAP 分析
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_test_scaled)
+
+    # 特征重要性排序
+    feature_importance = pd.DataFrame({
+        'Feature': features,
+        'SHAP_Mean_Abs': np.abs(shap_values).mean(axis=0)
+    }).sort_values(by='SHAP_Mean_Abs', ascending=False)
+
+    print("\nFeature Contribution Ranking:")
+    print(feature_importance)
+
+    # 保存 SHAP 图
+    plt.figure(figsize=(10,6))
+    shap.summary_plot(shap_values, pd.DataFrame(X_test_scaled, columns=features), show=False)
+    plt.title(f"{name} Feature Contribution (SHAP)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(SAVE_FOLDER, f"{name}_SHAP_Summary.png"))
+    plt.close()
+
+    # 保存排序表
+    feature_importance.to_csv(os.path.join(SAVE_FOLDER, f"{name}_Feature_Contribution.csv"), index=False)
+
+print(f"\n✅ 分析完成，结果保存在: {SAVE_FOLDER}")

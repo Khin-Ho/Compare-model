@@ -1,0 +1,187 @@
+import os
+import tempfile
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.metrics import r2_score
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+
+import xgboost as xgb
+import joblib as jl
+
+# ====================== 临时文件夹修正 ======================
+tempfile.tempdir = r"C:\Temp"
+os.makedirs(tempfile.tempdir, exist_ok=True)
+
+# ====================== 路径 ======================
+DATA_PATH = r"E:\桌面\Milk\积分milk.xlsx"
+SAVE_FOLDER = r"E:\桌面\Milk\model_final"
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# ====================== 读取数据 ======================
+df = pd.read_excel(DATA_PATH)
+
+# 统一列名
+df = df.rename(columns={
+    'PS(%)': 'PS',
+    'KOH(%)': 'KOH'
+})
+
+# ====================== ⭐ X：特征工程 ======================
+# 加药强度与化学作用表达
+df['Reaction_Intensity'] = df['PS'] * df['KOH']
+df['Dosage_Ratio'] = df['PS'] / (df['KOH'] + 0.01)
+
+# 新鲜 DOM → 腐殖 DOM 的潜在转化压力
+df['Degradation_Potential'] = (df['R1o'] + df['R2o']) / (df['R5o'] + 0.01)
+
+# ====================== ⭐ Y：复合腐殖化指标（核心） ======================
+# 物理含义：
+#   + HIX：芳香性 / 腐殖化
+#   + R3 + R5：腐殖样增强
+#   - R1 + R2 + R4：新鲜/蛋白样削弱
+
+df['Humic_gain'] = df['R3o'] + df['R5o']
+df['Labile_loss'] = df['R1o'] + df['R2o'] + df['R4o']
+
+scaler_Y = StandardScaler()
+Y_components = df[['HIX', 'Humic_gain', 'Labile_loss']]
+Y_z = scaler_Y.fit_transform(Y_components)
+
+df['Y'] = (
+    Y_z[:, 0]   # Z(HIX)
+    + Y_z[:, 1] # Z(R3 + R5)
+    - Y_z[:, 2] # Z(R1 + R2 + R4)
+)
+
+y = df['Y'].values
+
+# 保存 Y 的 scaler（用于复现和论文）
+jl.dump(scaler_Y, os.path.join(SAVE_FOLDER, "scaler_Y.pkl"))
+
+# ====================== ⭐ X 特征列表 ======================
+features = [
+    'PS',
+    'KOH',
+    'Reaction_Intensity',
+    'Dosage_Ratio',
+    'Degradation_Potential',
+    'R5o'
+]
+
+X = df[features].values
+
+# ====================== 数据划分 ======================
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=0.2,
+    random_state=2497
+)
+
+# ====================== X 标准化（仅对 X） ======================
+scaler_X = StandardScaler()
+X_train = scaler_X.fit_transform(X_train)
+X_test = scaler_X.transform(X_test)
+
+jl.dump(scaler_X, os.path.join(SAVE_FOLDER, "scaler_X.pkl"))
+
+# ====================== 模型定义 ======================
+models = {
+    "Ridge": Ridge(),
+    "KNN": KNeighborsRegressor(),
+    "SVR": SVR(),
+    "DecisionTree": DecisionTreeRegressor(random_state=2497),
+    "RandomForest": RandomForestRegressor(random_state=2497),
+    "GradientBoosting": GradientBoostingRegressor(random_state=2497),
+    "XGBoost": xgb.XGBRegressor(
+        random_state=2497,
+        n_jobs=1,
+        objective='reg:squarederror'
+    )
+}
+
+# ====================== 超参数搜索空间 ======================
+param_grid = {
+    'Ridge': {'alpha': [0.1, 1, 5, 10, 20]},
+    'KNN': {'n_neighbors': [3, 5, 7, 9],
+            'weights': ['uniform', 'distance'],
+            'p': [1, 2]},
+    'SVR': {'C': [0.1, 1, 5, 10],
+            'epsilon': [0.01, 0.05, 0.1],
+            'kernel': ['rbf', 'linear']},
+    'DecisionTree': {'max_depth': [3, 4, 5, 6],
+                     'min_samples_split': [2, 5, 10],
+                     'min_samples_leaf': [1, 2, 3]},
+    'RandomForest': {'n_estimators': [100, 150, 200],
+                     'max_depth': [4, 6, 8],
+                     'min_samples_split': [2, 5, 10],
+                     'min_samples_leaf': [1, 2]},
+    'GradientBoosting': {'n_estimators': [100, 150, 200],
+                         'learning_rate': [0.01, 0.03, 0.05],
+                         'max_depth': [3, 4, 5]},
+    'XGBoost': {'n_estimators': [100, 150, 200],
+                'learning_rate': [0.01, 0.03, 0.05],
+                'max_depth': [3, 4, 5],
+                'subsample': [0.7, 0.8, 1.0],
+                'colsample_bytree': [0.7, 0.8, 1.0],
+                'reg_alpha': [0, 0.1, 0.5, 1],
+                'reg_lambda': [1, 5, 10]}
+}
+
+# ====================== 训练与评估 ======================
+results = []
+
+for name, model in models.items():
+    print(f"\n🚀 Training {name} ...")
+
+    grid = GridSearchCV(
+        model,
+        param_grid[name],
+        cv=5,
+        scoring='r2',
+        n_jobs=1,
+        verbose=1
+    )
+
+    grid.fit(X_train, y_train)
+    best_model = grid.best_estimator_
+
+    train_r2 = r2_score(y_train, best_model.predict(X_train))
+    test_r2 = r2_score(y_test, best_model.predict(X_test))
+    cv_r2 = cross_val_score(
+        best_model, X_train, y_train,
+        cv=5, scoring='r2', n_jobs=1
+    ).mean()
+
+    print(
+        f"{name} | "
+        f"Train R² = {train_r2:.3f}, "
+        f"Test R² = {test_r2:.3f}, "
+        f"CV R² = {cv_r2:.3f}"
+    )
+
+    jl.dump(best_model, os.path.join(SAVE_FOLDER, f"{name}.pkl"))
+
+    results.append({
+        'Model': name,
+        'Train_R2': train_r2,
+        'Test_R2': test_r2,
+        'CV_R2': cv_r2
+    })
+
+# ====================== 保存结果 ======================
+results_df = pd.DataFrame(results)
+results_df.to_csv(
+    os.path.join(SAVE_FOLDER, "model_results_composite_Y.csv"),
+    index=False
+)
+
+print("\n===== ✅ Final Results =====")
+print(results_df)
+print(f"\n📁 All outputs saved in: {SAVE_FOLDER}")

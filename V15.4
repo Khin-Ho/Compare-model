@@ -1,0 +1,55 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# V15.4：加入总荧光强度、腐殖样和蛋白样特征
+DATA_PATH = r"E:\桌面\Milk\积分milk.xlsx"
+OUT = r"E:\桌面\Milk\V15.4_results"
+SEED = 888
+os.makedirs(OUT, exist_ok=True)
+df = pd.read_excel(DATA_PATH).rename(columns={"PS(%)": "PS", "KOH(%)": "KOH"})
+cols = ["PS", "KOH", "R1o", "R2o", "R3o", "R4o", "R5o", "HIX"]
+df = df.dropna(subset=cols).reset_index(drop=True)
+eps = 1e-8
+df["Reaction_Intensity"] = df.PS * df.KOH
+df["Dosage_Ratio"] = df.PS / (df.KOH + eps)
+df["Degradation_Potential"] = (df.R1o + df.R2o) / (df.R5o + eps)
+df["R1o_R2o"] = df.R1o / (df.R2o + eps)
+df["R3o_R4o"] = df.R3o / (df.R4o + eps)
+df["Total_Fluorescence"] = df[["R1o", "R2o", "R3o", "R4o", "R5o"]].sum(axis=1)
+df["Humic_like"] = df.R3o + df.R5o
+df["Protein_like"] = df.R1o + df.R2o
+features = cols[:-1] + [
+    "Reaction_Intensity", "Dosage_Ratio", "Degradation_Potential",
+    "R1o_R2o", "R3o_R4o", "Total_Fluorescence", "Humic_like", "Protein_like"
+]
+Xtr, Xte, ytr, yte = train_test_split(
+    df[features], df.HIX, test_size=0.2, random_state=SEED
+)
+scaler = StandardScaler()
+Xtr, Xte = scaler.fit_transform(Xtr), scaler.transform(Xte)
+models = {
+    "GradientBoosting": GradientBoostingRegressor(
+        n_estimators=200, learning_rate=0.03, max_depth=3, random_state=SEED
+    ),
+    "RandomForest": RandomForestRegressor(
+        n_estimators=200, max_depth=6, random_state=SEED, n_jobs=1
+    ),
+}
+result = []
+for name, model in models.items():
+    model.fit(Xtr, ytr)
+    p = model.predict(Xte)
+    result.append({
+        "Model": name, "R2": r2_score(yte, p),
+        "MAE": mean_absolute_error(yte, p),
+        "RMSE": np.sqrt(mean_squared_error(yte, p)),
+    })
+pd.DataFrame(result).sort_values("R2", ascending=False).to_csv(
+    os.path.join(OUT, "model_results.csv"), index=False, encoding="utf-8-sig"
+)
+print(pd.DataFrame(result).sort_values("R2", ascending=False))

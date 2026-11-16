@@ -1,0 +1,36 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# V15.5：加入腐殖样、蛋白样及比例特征
+DATA_PATH = r"E:\桌面\Milk\积分milk.xlsx"
+SAVE_FOLDER = r"E:\桌面\Milk\V15.5_results"
+SEED = 888
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+df = pd.read_excel(DATA_PATH).rename(columns={"PS(%)": "PS", "KOH(%)": "KOH"})
+required = ["PS", "KOH", "R1o", "R2o", "R3o", "R4o", "R5o", "HIX"]
+df = df.dropna(subset=required).reset_index(drop=True)
+eps = 1e-8
+df["Reaction_Intensity"] = df.PS * df.KOH
+df["Dosage_Ratio"] = df.PS / (df.KOH + eps)
+df["Total_Fluorescence"] = df[required[2:7]].sum(axis=1)
+df["Humic_like"] = df.R3o + df.R5o
+df["Protein_like"] = df.R1o + df.R2o
+df["Humic_Protein_Ratio"] = df.Humic_like / (df.Protein_like + eps)
+features = required[:-1] + ["Reaction_Intensity", "Dosage_Ratio", "Total_Fluorescence",
+    "Humic_like", "Protein_like", "Humic_Protein_Ratio"]
+Xtr, Xte, ytr, yte = train_test_split(df[features], df.HIX, test_size=0.2, random_state=SEED)
+scaler = StandardScaler()
+Xtr, Xte = scaler.fit_transform(Xtr), scaler.transform(Xte)
+models = {"GradientBoosting": GradientBoostingRegressor(n_estimators=200, learning_rate=0.03, max_depth=3, random_state=SEED),
+          "RandomForest": RandomForestRegressor(n_estimators=200, max_depth=6, random_state=SEED, n_jobs=1)}
+rows = []
+for name, model in models.items():
+    model.fit(Xtr, ytr); pred = model.predict(Xte)
+    rows.append({"Model": name, "R2": r2_score(yte, pred), "MAE": mean_absolute_error(yte, pred), "RMSE": np.sqrt(mean_squared_error(yte, pred))})
+pd.DataFrame(rows).sort_values("R2", ascending=False).to_csv(os.path.join(SAVE_FOLDER, "model_results.csv"), index=False, encoding="utf-8-sig")
+print(pd.DataFrame(rows).sort_values("R2", ascending=False))

@@ -1,0 +1,25 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.metrics import r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# V15.12：使用多个随机种子检查模型稳定性
+DATA_PATH = r"E:\桌面\Milk\积分milk.xlsx"
+OUT = r"E:\桌面\Milk\V15.12_results"
+os.makedirs(OUT, exist_ok=True)
+df = pd.read_excel(DATA_PATH).rename(columns={"PS(%)": "PS", "KOH(%)": "KOH"})
+cols = ["PS", "KOH", "R1o", "R2o", "R3o", "R4o", "R5o", "HIX"]; df = df.dropna(subset=cols).reset_index(drop=True); eps = 1e-8
+df["Reaction_Intensity"] = df.PS * df.KOH; df["Dosage_Ratio"] = df.PS / (df.KOH + eps); df["Total_Fluorescence"] = df[cols[2:7]].sum(axis=1)
+df["Humic_like"] = df.R3o + df.R5o; df["Protein_like"] = df.R1o + df.R2o
+features = cols[:-1] + ["Reaction_Intensity", "Dosage_Ratio", "Total_Fluorescence", "Humic_like", "Protein_like"]
+rows = []
+for seed in [888, 889, 890, 891, 892]:
+    a, b, c, d = train_test_split(df[features], df.HIX, test_size=0.2, random_state=seed)
+    scaler = StandardScaler(); a, b = scaler.fit_transform(a), scaler.transform(b)
+    model = GradientBoostingRegressor(n_estimators=200, learning_rate=0.03, max_depth=3, random_state=seed); model.fit(a, c)
+    rows.append({"Seed": seed, "Test_R2": r2_score(d, model.predict(b))})
+pd.DataFrame(rows).to_csv(os.path.join(OUT, "stability_results.csv"), index=False, encoding="utf-8-sig")
+print(pd.DataFrame(rows)); print(f"平均 R2: {np.mean([row['Test_R2'] for row in rows]):.3f}")

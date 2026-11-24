@@ -1,0 +1,29 @@
+import os
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# V15.13：训练后读取新样品并输出 HIX 预测
+DATA_PATH = r"E:\桌面\Milk\积分milk.xlsx"
+NEW_SAMPLE_PATH = r"E:\桌面\Milk\new_sample.xlsx"
+OUT = r"E:\桌面\Milk\V15.13_results"
+os.makedirs(OUT, exist_ok=True)
+cols = ["PS", "KOH", "R1o", "R2o", "R3o", "R4o", "R5o", "HIX"]; eps = 1e-8
+df = pd.read_excel(DATA_PATH).rename(columns={"PS(%)": "PS", "KOH(%)": "KOH"}).dropna(subset=cols)
+def make_features(data):
+    data = data.rename(columns={"PS(%)": "PS", "KOH(%)": "KOH"}).copy()
+    data["Reaction_Intensity"] = data.PS * data.KOH; data["Dosage_Ratio"] = data.PS / (data.KOH + eps)
+    data["Total_Fluorescence"] = data[cols[2:7]].sum(axis=1); data["Humic_like"] = data.R3o + data.R5o; data["Protein_like"] = data.R1o + data.R2o
+    return data
+df = make_features(df); features = cols[:-1] + ["Reaction_Intensity", "Dosage_Ratio", "Total_Fluorescence", "Humic_like", "Protein_like"]
+a, b, c, d = train_test_split(df[features], df.HIX, test_size=0.2, random_state=888); scaler = StandardScaler(); a, b = scaler.fit_transform(a), scaler.transform(b)
+model = GradientBoostingRegressor(n_estimators=200, learning_rate=0.03, max_depth=3, random_state=888); model.fit(a, c)
+if not os.path.exists(NEW_SAMPLE_PATH):
+    raise FileNotFoundError(f"请准备新样品文件: {NEW_SAMPLE_PATH}")
+sample = make_features(pd.read_excel(NEW_SAMPLE_PATH)); prediction = model.predict(scaler.transform(sample[features]))
+pd.DataFrame({"Predicted_HIX": prediction}).to_csv(os.path.join(OUT, "new_sample_predictions.csv"), index=False, encoding="utf-8-sig")
+joblib.dump({"model": model, "scaler": scaler, "features": features}, os.path.join(OUT, "model_package.pkl"))
+print(pd.DataFrame({"Predicted_HIX": prediction}))

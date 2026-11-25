@@ -1,0 +1,19 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# V15.14：根据测试残差估计 95% 预测区间
+DATA_PATH = r"E:\桌面\Milk\积分milk.xlsx"
+OUT = r"E:\桌面\Milk\V15.14_results"
+os.makedirs(OUT, exist_ok=True)
+df = pd.read_excel(DATA_PATH).rename(columns={"PS(%)": "PS", "KOH(%)": "KOH"}); cols = ["PS", "KOH", "R1o", "R2o", "R3o", "R4o", "R5o", "HIX"]; df = df.dropna(subset=cols); eps = 1e-8
+df["Reaction_Intensity"] = df.PS * df.KOH; df["Dosage_Ratio"] = df.PS / (df.KOH + eps); df["Total_Fluorescence"] = df[cols[2:7]].sum(axis=1); df["Humic_like"] = df.R3o + df.R5o; df["Protein_like"] = df.R1o + df.R2o
+features = cols[:-1] + ["Reaction_Intensity", "Dosage_Ratio", "Total_Fluorescence", "Humic_like", "Protein_like"]
+a, b, c, d = train_test_split(df[features], df.HIX, test_size=0.2, random_state=888); scaler = StandardScaler(); a, b = scaler.fit_transform(a), scaler.transform(b)
+model = GradientBoostingRegressor(n_estimators=200, learning_rate=0.03, max_depth=3, random_state=888); model.fit(a, c); prediction = model.predict(b); residual = d.to_numpy() - prediction
+low, high = np.quantile(residual, [0.025, 0.975])
+pd.DataFrame({"Observed_HIX": d, "Predicted_HIX": prediction, "Lower_95": prediction + low, "Upper_95": prediction + high}).to_csv(os.path.join(OUT, "prediction_intervals.csv"), index=False, encoding="utf-8-sig")
+print(f"95% 区间残差范围: {low:.4f} ~ {high:.4f}")

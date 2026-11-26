@@ -1,0 +1,17 @@
+import os
+import pandas as pd
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# V15.15：输出特征与 HIX 的相关性报告
+DATA_PATH = r"E:\桌面\Milk\积分milk.xlsx"
+OUT = r"E:\桌面\Milk\V15.15_results"
+os.makedirs(OUT, exist_ok=True)
+df = pd.read_excel(DATA_PATH).rename(columns={"PS(%)": "PS", "KOH(%)": "KOH"}); cols = ["PS", "KOH", "R1o", "R2o", "R3o", "R4o", "R5o", "HIX"]; df = df.dropna(subset=cols); eps = 1e-8
+df["Reaction_Intensity"] = df.PS * df.KOH; df["Dosage_Ratio"] = df.PS / (df.KOH + eps); df["Total_Fluorescence"] = df[cols[2:7]].sum(axis=1); df["Humic_like"] = df.R3o + df.R5o; df["Protein_like"] = df.R1o + df.R2o
+features = cols[:-1] + ["Reaction_Intensity", "Dosage_Ratio", "Total_Fluorescence", "Humic_like", "Protein_like"]
+df[features + ["HIX"]].corr()["HIX"].sort_values(ascending=False).to_csv(os.path.join(OUT, "feature_hix_correlation.csv"), encoding="utf-8-sig")
+a, b, c, d = train_test_split(df[features], df.HIX, test_size=0.2, random_state=888); scaler = StandardScaler(); a = scaler.fit_transform(a); b = scaler.transform(b)
+model = GradientBoostingRegressor(n_estimators=200, learning_rate=0.03, max_depth=3, random_state=888); model.fit(a, c)
+print("相关性报告已保存。测试集 R2:", model.score(b, d))

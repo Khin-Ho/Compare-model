@@ -1,0 +1,143 @@
+import json
+import os
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+
+# V15.16：整合前面功能，生成最终模型结果和运行报告
+DATA_PATH = r"E:\桌面\Milk\积分milk.xlsx"
+OUT = r"E:\桌面\Milk\V15.16_results"
+SEED = 888
+
+REQUIRED_COLUMNS = [
+    "PS",
+    "KOH",
+    "R1o",
+    "R2o",
+    "R3o",
+    "R4o",
+    "R5o",
+    "HIX",
+]
+DERIVED_FEATURES = [
+    "Reaction_Intensity",
+    "Dosage_Ratio",
+    "Total_Fluorescence",
+    "Humic_like",
+    "Protein_like",
+]
+
+
+def load_data():
+    """读取数据、统一列名并删除建模所需字段为空的样本。"""
+    data = pd.read_excel(DATA_PATH).rename(
+        columns={"PS(%)": "PS", "KOH(%)": "KOH"}
+    )
+
+    missing_columns = [
+        column for column in REQUIRED_COLUMNS if column not in data.columns
+    ]
+    if missing_columns:
+        raise ValueError(f"缺少必要列: {missing_columns}")
+
+    return data.dropna(subset=REQUIRED_COLUMNS).reset_index(drop=True)
+
+
+def add_features(data):
+    """根据原始指标生成 V15 系列使用的衍生特征。"""
+    data = data.copy()
+    epsilon = 1e-8
+
+    data["Reaction_Intensity"] = data["PS"] * data["KOH"]
+    data["Dosage_Ratio"] = data["PS"] / (data["KOH"] + epsilon)
+    data["Total_Fluorescence"] = data[
+        ["R1o", "R2o", "R3o", "R4o", "R5o"]
+    ].sum(axis=1)
+    data["Humic_like"] = data["R3o"] + data["R5o"]
+    data["Protein_like"] = data["R1o"] + data["R2o"]
+    return data
+
+
+def build_models():
+    """创建需要比较的回归模型。"""
+    return {
+        "GradientBoosting": GradientBoostingRegressor(
+            n_estimators=200,
+            learning_rate=0.03,
+            max_depth=3,
+            random_state=SEED,
+        ),
+        "RandomForest": RandomForestRegressor(
+            n_estimators=200,
+            max_depth=6,
+            random_state=SEED,
+            n_jobs=1,
+        ),
+    }
+
+
+def main():
+    os.makedirs(OUT, exist_ok=True)
+
+    data = add_features(load_data())
+    features = REQUIRED_COLUMNS[:-1] + DERIVED_FEATURES
+
+    x_train, x_test, y_train, y_test = train_test_split(
+        data[features],
+        data["HIX"],
+        test_size=0.2,
+        random_state=SEED,
+    )
+
+    scaler = StandardScaler()
+    x_train_scaled = scaler.fit_transform(x_train)
+    x_test_scaled = scaler.transform(x_test)
+
+    rows = []
+    for name, model in build_models().items():
+        model.fit(x_train_scaled, y_train)
+        prediction = model.predict(x_test_scaled)
+        rows.append(
+            {
+                "Model": name,
+                "R2": r2_score(y_test, prediction),
+                "MAE": mean_absolute_error(y_test, prediction),
+                "RMSE": np.sqrt(mean_squared_error(y_test, prediction)),
+            }
+        )
+
+    results = pd.DataFrame(rows).sort_values(
+        "R2", ascending=False
+    ).reset_index(drop=True)
+    results.to_csv(
+        os.path.join(OUT, "final_model_results.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    best_model = results.iloc[0]
+    report = {
+        "version": "V15.16",
+        "rows": len(data),
+        "features": features,
+        "best_model": best_model["Model"],
+        "best_test_r2": float(best_model["R2"]),
+    }
+    with open(
+        os.path.join(OUT, "run_report.json"),
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(report, file, ensure_ascii=False, indent=2)
+
+    print("V15.16 完成")
+    print(results)
+
+
+if __name__ == "__main__":
+    main()

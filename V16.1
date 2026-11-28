@@ -1,0 +1,101 @@
+import os
+import joblib
+import numpy as np
+import pandas as pd
+
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# ============================================================
+# V16.1：在 V16.0 的复合 Y 基础上，增加数据检查和完整误差指标
+# ============================================================
+VERSION = "V16.1"
+DATA_PATH = r"E:\桌面\Milk\积分milk.xlsx"
+SAVE_FOLDER = r"E:\桌面\Milk\V16.1_results"
+RANDOM_STATE = 2497
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# 1. 读取并检查数据
+df = pd.read_excel(DATA_PATH)
+df = df.rename(columns={"PS(%)": "PS", "KOH(%)": "KOH"})
+required_columns = ["PS", "KOH", "R1o", "R2o", "R3o", "R4o", "R5o", "HIX"]
+missing_columns = [column for column in required_columns if column not in df.columns]
+if missing_columns:
+    raise ValueError(f"缺少必要列: {missing_columns}")
+df = df.dropna(subset=required_columns).reset_index(drop=True)
+
+# 2. X 特征工程
+epsilon = 1e-8
+df["Reaction_Intensity"] = df["PS"] * df["KOH"]
+df["Dosage_Ratio"] = df["PS"] / (df["KOH"] + epsilon)
+df["Degradation_Potential"] = (
+    df["R1o"] + df["R2o"]
+) / (df["R5o"] + epsilon)
+
+# 3. 构造复合 Y
+df["Humic_gain"] = df["R3o"] + df["R5o"]
+df["Labile_loss"] = df["R1o"] + df["R2o"] + df["R4o"]
+scaler_y = StandardScaler()
+y_components = scaler_y.fit_transform(
+    df[["HIX", "Humic_gain", "Labile_loss"]]
+)
+df["Y"] = y_components[:, 0] + y_components[:, 1] - y_components[:, 2]
+
+features = [
+    "PS", "KOH", "Reaction_Intensity", "Dosage_Ratio",
+    "Degradation_Potential", "R5o",
+]
+X = df[features]
+y = df["Y"]
+
+# 4. 划分数据并标准化 X
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=RANDOM_STATE
+)
+scaler_x = StandardScaler()
+X_train_scaled = scaler_x.fit_transform(X_train)
+X_test_scaled = scaler_x.transform(X_test)
+
+# 5. 训练模型
+model = GradientBoostingRegressor(
+    n_estimators=200,
+    learning_rate=0.03,
+    max_depth=3,
+    random_state=RANDOM_STATE,
+)
+model.fit(X_train_scaled, y_train)
+
+# 6. 评估模型
+train_prediction = model.predict(X_train_scaled)
+test_prediction = model.predict(X_test_scaled)
+metrics = {
+    "Version": VERSION,
+    "Train_R2": r2_score(y_train, train_prediction),
+    "Test_R2": r2_score(y_test, test_prediction),
+    "MAE": mean_absolute_error(y_test, test_prediction),
+    "RMSE": np.sqrt(mean_squared_error(y_test, test_prediction)),
+}
+
+# 7. 保存结果和模型
+pd.DataFrame([metrics]).to_csv(
+    os.path.join(SAVE_FOLDER, "metrics.csv"),
+    index=False,
+    encoding="utf-8-sig",
+)
+pd.DataFrame(
+    {
+        "Observed_Y": y_test.to_numpy(),
+        "Predicted_Y": test_prediction,
+        "Residual": y_test.to_numpy() - test_prediction,
+    }
+).to_csv(
+    os.path.join(SAVE_FOLDER, "predictions.csv"),
+    index=False,
+    encoding="utf-8-sig",
+)
+joblib.dump(scaler_x, os.path.join(SAVE_FOLDER, "scaler_X.pkl"))
+joblib.dump(scaler_y, os.path.join(SAVE_FOLDER, "scaler_Y.pkl"))
+joblib.dump(model, os.path.join(SAVE_FOLDER, "model.pkl"))
+print(pd.DataFrame([metrics]))
